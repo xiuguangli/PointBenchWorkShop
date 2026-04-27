@@ -1,3 +1,4 @@
+# Usage
 ```bash
 # only one gpu
 bash run.sh --gpu 0

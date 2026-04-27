@@ -770,7 +770,7 @@ def _run_sa2va_agent_justify_and_process_gemini_norefine(config, item, logger):
     local_resource = config.model_info.runtime_resource
     path = local_resource.get("sa2va_model_path") or local_resource.get("model_path")
     device = _get_local_device(config)
-    print(f"{path=}")
+    # print(f"{path=}")
     try:
         if not path:
             logger.error("sa2va_norefine requires sa2va_model_path/model_path in runtime_resource")
