@@ -32,5 +32,5 @@ uv run python model_evaluator.py \
   --model point_agent \
   --type point_agent \
   --start 0 \
-  --end 1 \
+  --end -1 \
   --suffix exp
