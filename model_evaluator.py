@@ -149,13 +149,28 @@ def _prepare_run_output_paths(run_output_name):
         path.mkdir(exist_ok=True, parents=True)
     return output_paths
 
-def _log_startup_parameters(model_name, model_type, query_field, max_workers, result_suffix, enhance_model, model_root, max_tokens, start, end, resume=True, auto_worker_by_gpu=False):
+def _log_startup_parameters(
+    model_name,
+    model_type,
+    query_field,
+    max_workers,
+    result_suffix,
+    enhance_model,
+    rewrite_model,
+    model_root,
+    max_tokens,
+    start,
+    end,
+    resume=True,
+    auto_worker_by_gpu=False,
+):
     startup_config = {
         "model": model_name,
         "type": model_type,
         "query_field": query_field,
         "suffix": result_suffix,
         "enhance_model": enhance_model,
+        "rewrite_model": rewrite_model,
         "model_root": model_root or "<huggingface-auto-download>",
         "max_tokens": max_tokens,
         "start": start,
@@ -2211,6 +2226,7 @@ def evaluate_model(
     max_workers=4,
     result_suffix="",
     enhance_model="gemini-3.1-pro-preview",
+    rewrite_model="gemini-3.5-flash",
     model_root="",
     max_tokens=256,
     start=0,
@@ -2242,6 +2258,7 @@ def evaluate_model(
         requested_workers,
         result_suffix,
         enhance_model,
+        rewrite_model,
         model_root,
         max_tokens,
         start,
@@ -2267,6 +2284,7 @@ def evaluate_model(
         runtime_options = {
             "query_field": query_field,
             "enhance_model": enhance_model,
+            "rewrite_model": rewrite_model,
             "planner_model_name": enhance_model,
             "api_key": os.getenv("API_KEY", ""),
             "base_url": os.getenv("API_BASE_URL", ""),
@@ -2496,7 +2514,8 @@ def _add_molmo2_gemini_cli_args(parser):
         default="",
         help="Optional local weight root for Molmo2. Leave empty to load/download the HuggingFace repo given by --model; when set to a directory, the code expects <model_root>/<huggingface_repo_id>, for example <model_root>/allenai/Molmo2-4B.",
     )
-    molmo2_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Gemini model used for rewrite, judge, and fallback grounding.")
+    molmo2_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Gemini model used for helper grounding, judge, and fallback.")
+    molmo2_group.add_argument("--rewrite_model", default="gemini-3.5-flash", help="Gemini model used for the transform_gemini_twolines-style rewrite stage.")
     molmo2_group.add_argument("--max_tokens", type=int, default=256, help="Max new tokens for Molmo2 generation.")
 
 
@@ -2545,6 +2564,7 @@ def main():
         pipeline_kwargs = {
             "model_root": args.model_root,
             "enhance_model": args.enhance_model,
+            "rewrite_model": args.rewrite_model,
             "max_tokens": args.max_tokens,
         }
 

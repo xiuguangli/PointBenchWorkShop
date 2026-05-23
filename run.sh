@@ -74,10 +74,11 @@ CMD=(
   --type molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge
   --query_field enhanced_query
   --enhance_model gemini-3.1-pro-preview
+  --rewrite_model gemini-3.5-flash
   --max_tokens 256
   --start 0
   --end -1
-  --suffix exp_2
+  --suffix exp_flash_rewrite
 )
 
 if [[ -n "$MODEL_ROOT" ]]; then

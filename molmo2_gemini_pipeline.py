@@ -845,6 +845,7 @@ def _build_stage_cache_signature(state: Dict[str, Any]) -> Dict[str, Any]:
         "pipeline": "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge",
         "question_field": state["question_field"],
         "planner_model_name": state["planner_model_name"],
+        "rewrite_model_name": state["rewrite_model_name"],
         "resolved_model_name": state["resolved_model_name"],
         "model_root": _normalize_model_root_for_signature(state["model_root"]),
         "max_tokens": state["max_tokens"],
@@ -1970,6 +1971,7 @@ def _build_initial_debug_meta(state: Dict[str, Any]) -> Dict[str, Any]:
         "raw_user_input": state["raw_user_input"],
         "rewrite_source_pipeline": REWRITE_SOURCE_PIPELINE_NAME,
         "rewrite_prompt_mode": REWRITE_PROMPT_MODE,
+        "rewrite_model_name": state["rewrite_model_name"],
         "rewrite_overlay_image_path": "",
         "rewrite_overlay_meta_path": "",
         "enhanced_user_input": "",
@@ -2083,6 +2085,11 @@ def build_molmo2_gemini_pipeline_state(
         or os.getenv("API_MODEL_NAME")
         or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.1-pro-preview")
     ).strip()
+    rewrite_model_name = str(
+        options.get("rewrite_model")
+        or os.getenv("API_REWRITE_MODEL_NAME")
+        or "gemini-3.5-flash"
+    ).strip()
     resolved_model_name = MOLMO2_MODEL_ALIASES.get(str(model_name or "").strip(), str(model_name or "").strip()) or "allenai/Molmo2-4B"
     max_tokens = int(options.get("max_tokens", 256))
     model_root = str(options.get("model_root", "")).strip()
@@ -2104,6 +2111,7 @@ def build_molmo2_gemini_pipeline_state(
         "api_key": api_key,
         "base_url": base_url,
         "planner_model_name": planner_model_name,
+        "rewrite_model_name": rewrite_model_name,
         "resolved_model_name": resolved_model_name,
         "max_tokens": max_tokens,
         "model_root": model_root,
@@ -2151,14 +2159,14 @@ def run_molmo2_gemini_rewrite_stage(state: Dict[str, Any]) -> Dict[str, Any]:
         enhanced_user_input = call_transform_gemini(
             image_path=state["image_path"],
             object_name=state["raw_user_input"],
-            model_name=state["planner_model_name"],
+            model_name=state["rewrite_model_name"],
             category=state["category"],
             item_ctx=state["item"],
             runtime_options={
                 "image_points_map": state["image_points_map"],
                 "api_key": state["api_key"],
                 "base_url": state["base_url"],
-                "enhance_model": state["planner_model_name"],
+                "enhance_model": state["rewrite_model_name"],
                 "visualizations_dir": state["runtime_options"].get("visualizations_dir", ""),
                 "rewrite_prompt_mode": REWRITE_PROMPT_MODE,
             },
@@ -2183,6 +2191,7 @@ def run_molmo2_gemini_rewrite_stage(state: Dict[str, Any]) -> Dict[str, Any]:
     state["debug_meta"]["enhanced_user_input"] = enhanced_user_input
     state["debug_meta"]["rewrite_source_pipeline"] = REWRITE_SOURCE_PIPELINE_NAME
     state["debug_meta"]["rewrite_prompt_mode"] = REWRITE_PROMPT_MODE
+    state["debug_meta"]["rewrite_model_name"] = state["rewrite_model_name"]
     state["debug_meta"]["rewrite_overlay_image_path"] = str(state["item"].get("rewrite_overlay_path") or "")
     state["debug_meta"]["rewrite_overlay_meta_path"] = str(state["item"].get("rewrite_overlay_meta_path") or "")
     return _save_stage_cache(state, "rewrite")
@@ -2619,6 +2628,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python model_evaluator.py \
   --model_root /path/to/models \
   --query_field enhanced_query \
   --enhance_model gemini-3.1-pro-preview \
+  --rewrite_model gemini-3.5-flash \
   --max_tokens 256 \
   --suffix molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge_exp \
   --start 0 \
@@ -2657,12 +2667,17 @@ Argument descriptions and supported values
 - `--enhance_model`
   - Purpose: Gemini model name.
   - In the current pipeline it is used for:
-    - transform rewriting
     - box/center helper grounding
     - judge
     - fallback grounding
   - Common values:
     - `gemini-3.1-pro-preview`
+    - Any other Gemini model name supported by your API endpoint
+
+- `--rewrite_model`
+  - Purpose: Gemini model name used only for the transform_gemini_twolines-style rewrite stage.
+  - Common values:
+    - `gemini-3.5-flash`: current reproduction-oriented default
     - Any other Gemini model name supported by your API endpoint
 
 - `--max_tokens`
@@ -2721,7 +2736,8 @@ Environment variables
 Notes
 
 - `transform_gemini` is still kept in this file as the internal function `call_transform_gemini(...)`.
-- Internally the rewrite stage now follows `transform_gemini_twolines` with the original project's `legacy_reference_overlay` prompt plus the reference-point overlay/grid visualization rules.
+- Internally the rewrite stage follows `transform_gemini_twolines` with the original project's `legacy_reference_overlay` prompt plus the reference-point overlay/grid visualization rules.
+- The default split is now: `rewrite_model=gemini-3.5-flash`, `enhance_model=gemini-3.1-pro-preview`.
 - In the refpoint-hybrid version, Gemini helper box grounding is now executed on demand inside PointBench for each sample instead of relying on an externally precomputed `hosted_api_box_center` directory.
 - If the Gemini helper does not produce a box for the current sample, the local prompt automatically falls back to the dualquery prompt branch instead of failing immediately because of the missing box.
 """
