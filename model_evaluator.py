@@ -1,11 +1,9 @@
 import os
 import json
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import get_context
-from queue import Empty
-import random
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import csv
+import multiprocessing as mp
 import re  # Add explicit import for re
 from pathlib import Path
 import shutil
@@ -16,10 +14,12 @@ from dotenv import load_dotenv
 import io
 import unicodedata
 from tqdm import tqdm
-from point_agent import (
-    POINT_AGENT_MODEL_TYPES,
-    build_sa2va_norefine_config,
-    call_sa2va_agent_justify_and_process_gemini_norefine as run_sa2va_agent_justify_and_process_gemini_norefine,
+from runtime_warnings import suppress_known_runtime_warnings
+
+suppress_known_runtime_warnings()
+
+from molmo2_gemini_pipeline import (
+    call_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge as run_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge,
 )
 
 # Import the same model interfaces and helpers as the main app
@@ -44,7 +44,10 @@ import anthropic
 # Load environment variables
 load_dotenv()
 
-def get_logger(logs_dir="logs", log_name="log"):
+WORKER_RUNTIME_OPTIONS: Dict[str, Any] = {}
+IMPORT_LOG_TO_STDERR = os.getenv("POINTBENCH_SILENT_STDERR_IMPORT") != "1"
+
+def get_logger(logs_dir="logs", log_name="log", log_to_stderr=True):
     from loguru import logger
     from datetime import datetime
     import sys
@@ -78,7 +81,8 @@ def get_logger(logs_dir="logs", log_name="log"):
     current_date = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     log_name = f"{logs_dir}/{log_name}_{current_date}.log"
     logger.add(log_name, format=log_format, level="INFO")
-    logger.add(sys.stderr, format=log_format, level="INFO")
+    if log_to_stderr:
+        logger.add(sys.stderr, format=log_format, level="INFO")
     ignore_keys = ['key','api']
 
     # monkey patch logger.info: 支持 logger.info(dict) 自动美化
@@ -87,7 +91,11 @@ def get_logger(logs_dir="logs", log_name="log"):
     return logger
 
 import os
-logger = get_logger(logs_dir=f"logs/{os.path.basename(__file__)}", log_name="logs")
+logger = get_logger(
+    logs_dir=f"logs/{os.path.basename(__file__)}",
+    log_name="logs",
+    log_to_stderr=IMPORT_LOG_TO_STDERR,
+)
 
 # Configure API keys and clients
 # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -105,9 +113,6 @@ anthropic_client = None
 IMAGES_DIR = Path("data/images")
 MASKS_DIR = Path("data/masks")
 POINT_ON_MASK_DIR = Path("point_on_mask")  # New directory for visualization images
-SA2VA_PROCESS_VISIBLE_GPU_ID = None
-SA2VA_RESULT_MESSAGE = "result"
-SA2VA_DONE_MESSAGE = "done"
 
 # Create the point_on_mask directory if it doesn't exist
 POINT_ON_MASK_DIR.mkdir(exist_ok=True, parents=True)
@@ -128,45 +133,80 @@ def _prepare_run_output_paths(run_output_name):
     output_paths = {
         "results_dir": Path("static_results") / run_output_name,
         "point_on_mask_dir": POINT_ON_MASK_DIR / run_output_name,
-        "sa2va_visualizations_dir": Path("visualizations/point_agent") / run_output_name,
+        "pipeline_visualizations_dir": Path("visualizations") / run_output_name,
         "logs_dir": Path("logs") / os.path.basename(__file__) / run_output_name,
     }
     for path in output_paths.values():
         path.mkdir(exist_ok=True, parents=True)
     return output_paths
 
-def _parse_cuda_visible_devices():
-    value = os.getenv("CUDA_VISIBLE_DEVICES", "")
-    return [device.strip() for device in value.split(",") if device.strip()]
-
-def _set_cuda_visible_devices(value):
-    if value is None:
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+def _log_startup_parameters(model_name, model_type, query_field, max_workers, result_suffix, enhance_model, model_root, max_tokens, start, end, auto_worker_by_gpu=False):
+    startup_config = {
+        "model": model_name,
+        "type": model_type,
+        "query_field": query_field,
+        "suffix": result_suffix,
+        "enhance_model": enhance_model,
+        "model_root": model_root or "<huggingface-auto-download>",
+        "max_tokens": max_tokens,
+        "start": start,
+        "end": end,
+        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+        "visible_cuda_devices": _get_visible_cuda_devices(),
+    }
+    if auto_worker_by_gpu:
+        startup_config["worker_policy"] = "auto_by_visible_gpu_count"
     else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = value
+        startup_config["workers_requested"] = max_workers
+    logger.info("Startup parameters:\n" + json.dumps(startup_config, ensure_ascii=False, indent=2))
 
+def _log_worker_plan(model_type, effective_workers, worker_gpus, pending_count, use_process_pool, auto_worker_by_gpu=False, requested_workers=None):
+    worker_plan = {
+        "model_type": model_type,
+        "pending_items": pending_count,
+        "visible_cuda_devices": worker_gpus,
+        "effective_workers": effective_workers,
+        "execution_mode": "multiprocess_one_worker_per_gpu" if use_process_pool else "single_process",
+    }
+    if auto_worker_by_gpu:
+        if worker_gpus and pending_count > 0:
+            worker_plan["worker_selection_rule"] = "effective_workers = min(len(visible_cuda_devices), pending_items)"
+        elif worker_gpus:
+            worker_plan["worker_selection_rule"] = "no pending items -> no worker pool spawned"
+        else:
+            worker_plan["worker_selection_rule"] = "no visible gpu -> run in single process"
+    else:
+        worker_plan["requested_workers"] = requested_workers
+        if worker_gpus:
+            worker_plan["worker_selection_rule"] = "effective_workers = min(requested_workers, len(visible_cuda_devices), pending_items)"
+        else:
+            worker_plan["worker_selection_rule"] = "no visible gpu -> run in single process"
+    logger.info("Worker plan:\n" + json.dumps(worker_plan, ensure_ascii=False, indent=2))
 
-def _run_sa2va_process_worker(gpu_id, worker_items, result_queue, logs_dir):
-    global logger, SA2VA_PROCESS_VISIBLE_GPU_ID
+def _get_visible_cuda_devices():
+    raw_devices = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    if raw_devices:
+        return [device.strip() for device in raw_devices.split(",") if device.strip()]
+    if torch.cuda.is_available():
+        return [str(index) for index in range(torch.cuda.device_count())]
+    return []
 
-    SA2VA_PROCESS_VISIBLE_GPU_ID = "0"
-    logger = get_logger(logs_dir=logs_dir, log_name=f"gpu_{_safe_path_part(gpu_id)}")
-    logger.info(f"point_agent process worker started on physical GPU {gpu_id} as cuda:0")
+def _set_worker_runtime_options(runtime_options):
+    global WORKER_RUNTIME_OPTIONS
+    WORKER_RUNTIME_OPTIONS = runtime_options or {}
 
-    for task_args in worker_items:
-        result_queue.put((SA2VA_RESULT_MESSAGE, _evaluate_single_item(task_args)))
-    result_queue.put((SA2VA_DONE_MESSAGE, gpu_id))
-
-def _apply_sa2va_process_runtime(runtime_options):
-    if SA2VA_PROCESS_VISIBLE_GPU_ID is None:
-        return runtime_options
-
-    worker_runtime_options = dict(runtime_options)
-    config = worker_runtime_options["sa2va_config"]
-    # 每个 point_agent 子进程只暴露一张物理卡，因此进程内部统一使用逻辑 cuda:0。
-    config.args.worker_gpu_id = SA2VA_PROCESS_VISIBLE_GPU_ID
-    worker_runtime_options["sa2va_config"] = config
-    return worker_runtime_options
+def _init_pipeline_process_worker(gpu_queue, logs_dir, runtime_options):
+    global logger
+    assigned_gpu = str(gpu_queue.get())
+    os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu
+    _set_worker_runtime_options(runtime_options)
+    # 多卡时每个子进程固定绑定一张 GPU，并且只写自己的日志文件，
+    # 避免子进程 stdout/stderr 把主进度条刷乱。
+    logger = get_logger(
+        logs_dir=str(logs_dir),
+        log_name=f"worker_gpu_{_safe_path_part(assigned_gpu)}",
+        log_to_stderr=False,
+    )
 
 # Load the image_filename to points mapping from CSV file
 IMAGE_POINTS_MAP = {}
@@ -184,13 +224,14 @@ except Exception as e:
 # Available models
 OPENAI_MODELS = ["gpt-5.4","gpt-5.4-pro","gpt-4o", "o3", "gpt-4.1"]
 GEMINI_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06","gemini-2.0-flash"]
-GEMINI_MODELS = ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06","gemini-2.0-flash"]
+GEMINI_MODELS = ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-3.1-pro-preview","gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06","gemini-2.0-flash","gemini-3.5-flash"]
 MOLMO_MODELS = ["Molmo-7B-D-0924", "Molmo-7B-O-0924", "Molmo-72B-0924"]
 QWEN_MODELS = ["Qwen2.5-VL-7B-Instruct", "Qwen2.5-VL-32B-Instruct", "Qwen2.5-VL-72B-Instruct"]
 LLAVA_MODELS = ["llava-onevision-qwen2-7b-ov-hf"]
 CLAUDE_MODELS = ["claude-3-7-sonnet-20250219"]
 GROK_MODELS = ["grok-2-vision-latest"]
-POINT_AGENT_MODELS = ["point_agent"]
+MOLMO2_PIPELINE_MODEL_TYPES = {"molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge"}
+QUERY_GENERATING_MODEL_TYPES = MOLMO2_PIPELINE_MODEL_TYPES
 
 # Use local models
 USE_LOCAL_MODELS = True
@@ -671,9 +712,13 @@ def call_gemini(image_path, object_name, model_name="gemini-2.0-flash", category
         # model = genai.GenerativeModel(model_name)
         # api_key = os.getenv("GOOGLE_API_KEY")
         # client = genai.Client(api_key=api_key)
-        api_key = os.getenv("UNIAPI_KEY")
-        client = genai.Client(http_options=types.HttpOptions(base_url='https://api.uniapi.io/gemini'),
+        api_key = os.getenv("API_KEY")
+        base_url = os.getenv("API_BASE_URL", "")
+        if base_url:
+            client = genai.Client(http_options=types.HttpOptions(base_url=base_url),
         api_key=api_key)
+        else:
+            client = genai.Client(api_key=api_key)
         # logger.info(f"{api_key=}")
         
         # Get image dimensions
@@ -1587,14 +1632,14 @@ def visualize_points_on_mask(image_path, mask, points, output_path, img_width, i
         return False
 
 def _evaluate_single_item(task_args):
-    display_index, source_index, item, data_size, model_name, model_type, model_func, query_field, runtime_options, point_on_mask_dir = task_args
+    display_index, source_index, item, data_size, model_name, model_type, model_func, query_field, point_on_mask_dir = task_args
     image_filename = item["image_filename"]
     mask_filename = item["mask_filename"]
-    
+    runtime_options = WORKER_RUNTIME_OPTIONS
+
     messages = [f"Processing image {display_index+1}/{data_size}: {image_filename}"]
 
     def report(message):
-        logger.info(message)
         messages.append(message)
 
     def build_item_result(success, detail):
@@ -1603,7 +1648,7 @@ def _evaluate_single_item(task_args):
             "messages": messages,
             "detail": detail,
         }
-        if model_type.lower() in POINT_AGENT_MODEL_TYPES and item.get("enhanced_query"):
+        if model_type.lower() in QUERY_GENERATING_MODEL_TYPES and item.get("enhanced_query"):
             result["data_index"] = source_index
             result["query_field"] = query_field
             result["enhanced_query"] = item["enhanced_query"]
@@ -1674,9 +1719,8 @@ def _evaluate_single_item(task_args):
         )
 
     try:
-        if model_type.lower() in POINT_AGENT_MODEL_TYPES:
-            report(f"Testing {model_name} on image {image_filename}; point_agent will generate query from user_input: '{raw_query}'")
-            runtime_options = _apply_sa2va_process_runtime(runtime_options)
+        if model_type.lower() in MOLMO2_PIPELINE_MODEL_TYPES:
+            report(f"Testing {model_name} on image {image_filename}; {model_type} will generate points from user_input: '{raw_query}'")
             points = model_func(
                 image_path,
                 raw_query,
@@ -1757,94 +1801,46 @@ def _evaluate_single_item(task_args):
             },
         )
 
-def _terminate_sa2va_processes(processes):
-    for process in processes:
-        if process.is_alive():
-            logger.info(f"Terminating point_agent worker process pid={process.pid}")
-            process.terminate()
-    for process in processes:
-        process.join(timeout=10)
-    for process in processes:
-        if process.is_alive():
-            logger.info(f"Killing point_agent worker process pid={process.pid}")
-            process.kill()
-            process.join()
-
-
-def _iter_sa2va_process_results(pending_items, cuda_devices, logs_dir):
-    ctx = get_context("spawn")
-    result_queue = ctx.Queue()
-    buckets = {gpu_id: [] for gpu_id in cuda_devices}
-    for index, task_args in enumerate(pending_items):
-        buckets[cuda_devices[index % len(cuda_devices)]].append(task_args)
-
-    processes = []
-    pid_to_gpu = {}
-    finished_gpus = set()
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    interrupted = False
-    try:
-        for gpu_id, worker_items in buckets.items():
-            if not worker_items:
-                continue
-            # spawn 子进程会重新 import 本文件；这里先收缩可见卡，保证 torch import 前只看到单卡。
-            _set_cuda_visible_devices(str(gpu_id))
-            process = ctx.Process(
-                target=_run_sa2va_process_worker,
-                args=(gpu_id, worker_items, result_queue, str(logs_dir)),
-            )
-            process.start()
-            processes.append(process)
-            pid_to_gpu[process.pid] = gpu_id
-            logger.info(f"Started point_agent worker pid={process.pid} on physical GPU {gpu_id}")
-
-        _set_cuda_visible_devices(original_cuda_visible_devices)
-        while len(finished_gpus) < len(processes):
-            try:
-                message_type, payload = result_queue.get(timeout=1)
-            except Empty:
-                for process in processes:
-                    gpu_id = pid_to_gpu.get(process.pid)
-                    if gpu_id in finished_gpus:
-                        continue
-                    if not process.is_alive() and process.exitcode not in (None, 0):
-                        finished_gpus.add(gpu_id)
-                        logger.error(
-                            f"point_agent worker pid={process.pid} on GPU {gpu_id} "
-                            f"exited with code {process.exitcode}"
-                        )
-                continue
-
-            if message_type == SA2VA_RESULT_MESSAGE:
-                yield payload
-            elif message_type == SA2VA_DONE_MESSAGE:
-                finished_gpus.add(payload)
-
-        for process in processes:
-            process.join()
-    except KeyboardInterrupt:
-        interrupted = True
-        logger.info("Evaluation interrupted; terminating point_agent worker processes.")
-        raise
-    finally:
-        _set_cuda_visible_devices(original_cuda_visible_devices)
-        if interrupted or any(process.is_alive() for process in processes):
-            _terminate_sa2va_processes(processes)
-        result_queue.close()
-        result_queue.join_thread()
-
-
-def _iter_evaluation_results(pending_items, model_name, max_workers, cuda_devices, logs_dir):
-    if cuda_devices:
-        yield from _iter_sa2va_process_results(pending_items, cuda_devices, logs_dir)
+def _iter_evaluation_results(pending_items, model_name, max_workers, logs_dir, runtime_options, use_process_pool=False, gpu_ids=None):
+    del model_name
+    if not pending_items:
         return
 
+    if use_process_pool:
+        mp_context = mp.get_context("spawn")
+        gpu_queue = mp_context.Queue()
+        for gpu_id in (gpu_ids or [])[:max_workers]:
+            gpu_queue.put(gpu_id)
+
+        original_silent_flag = os.environ.get("POINTBENCH_SILENT_STDERR_IMPORT")
+        os.environ["POINTBENCH_SILENT_STDERR_IMPORT"] = "1"
+        try:
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_context,
+                initializer=_init_pipeline_process_worker,
+                initargs=(gpu_queue, str(logs_dir), runtime_options),
+            ) as executor:
+                futures = [executor.submit(_evaluate_single_item, item) for item in pending_items]
+                for future in as_completed(futures):
+                    yield future.result()
+        finally:
+            if original_silent_flag is None:
+                os.environ.pop("POINTBENCH_SILENT_STDERR_IMPORT", None)
+            else:
+                os.environ["POINTBENCH_SILENT_STDERR_IMPORT"] = original_silent_flag
+        return
+
+    _set_worker_runtime_options(runtime_options)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        yield from executor.map(_evaluate_single_item, pending_items)
+        futures = [executor.submit(_evaluate_single_item, item) for item in pending_items]
+        for future in as_completed(futures):
+            yield future.result()
 
 def _record_item_result(item_result, results, item_count, results_file, progress_callback, res_data=None, res_path=None):
     results["total"] += 1
     item_count += 1
+    should_log_checkpoint = item_count == 1 or item_count % 10 == 0
 
     if item_result["success"]:
         results["success"] += 1
@@ -1865,10 +1861,12 @@ def _record_item_result(item_result, results, item_count, results_file, progress
             res_data[data_index][query_field] = item_result["enhanced_query"]
         with open(res_path, "w") as f:
             json.dump(res_data, f, indent=2)
-        logger.info(f"Enhanced query saved to {res_path} for {item_result['detail']['image']}")
+        if should_log_checkpoint:
+            logger.info(f"Enhanced query saved to {res_path} for {item_result['detail']['image']}")
 
-    # 本评测经常跑很久，仍然保持每完成一张图就落盘。
-    if results["total"] > 0:
+    # 本评测经常跑很久，仍然保持每完成一张图就落盘；
+    # 但控制台只按 checkpoint 打印，避免把 tqdm 进度条刷乱。
+    if results["total"] > 0 and should_log_checkpoint:
         success_rate = results["success"] / results["total"] * 100
         logger.info(f"\nIntermediate results after {item_count} processed images:")
         logger.info(f"Total images: {results['total']}")
@@ -1885,7 +1883,8 @@ def _record_item_result(item_result, results, item_count, results_file, progress
 
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
-    logger.info(f"Intermediate results saved to {results_file}")
+    if should_log_checkpoint:
+        logger.info(f"Intermediate results saved to {results_file}")
     if progress_callback:
         progress_callback(f"Intermediate results saved to {results_file}")
     return item_count
@@ -1900,11 +1899,14 @@ def evaluate_model(
     result_suffix="",
     enhance_model="gemini-3.1-pro-preview",
     model_root="",
+    max_tokens=256,
     start=0,
     end=-1,
 ):
     """Evaluate model performance on the dataset."""
     global logger
+    requested_workers = max(1, int(max_workers))
+    auto_worker_by_gpu = model_type.lower() in MOLMO2_PIPELINE_MODEL_TYPES
 
     # Select the appropriate model call function based on model type
     model_type_lower = model_type.lower()
@@ -1919,7 +1921,20 @@ def evaluate_model(
     logger.info(f"Run output bucket: {run_output_name}")
     logger.info(f"Results dir: {output_paths['results_dir']}")
     logger.info(f"Point visualizations dir: {output_paths['point_on_mask_dir']}")
-    logger.info(f"point_agent visualizations dir: {output_paths['sa2va_visualizations_dir']}")
+    logger.info(f"Pipeline visualizations dir: {output_paths['pipeline_visualizations_dir']}")
+    _log_startup_parameters(
+        model_name,
+        model_type,
+        query_field,
+        requested_workers,
+        result_suffix,
+        enhance_model,
+        model_root,
+        max_tokens,
+        start,
+        end,
+        auto_worker_by_gpu=auto_worker_by_gpu,
+    )
 
     if model_type_lower == "openai":
         model_func = call_openai
@@ -1933,35 +1948,27 @@ def evaluate_model(
         model_func = call_claude
     elif model_type_lower == "grok":
         model_func = call_grok
-    elif model_type_lower in POINT_AGENT_MODEL_TYPES:
-        model_func = call_sa2va_agent_justify_and_process_gemini_norefine
-        cuda_devices = _parse_cuda_visible_devices()
+    elif model_type_lower in MOLMO2_PIPELINE_MODEL_TYPES:
+        model_func = run_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge
         runtime_options = {
             "query_field": query_field,
-            "model_root": model_root,
             "enhance_model": enhance_model,
-            "sa2va_config": build_sa2va_norefine_config(
-                model_name,
-                query_field,
-                model_root,
-                visualizations_dir=str(output_paths["sa2va_visualizations_dir"]),
-            ),
+            "planner_model_name": enhance_model,
+            "api_key": os.getenv("API_KEY", ""),
+            "base_url": os.getenv("API_BASE_URL", ""),
+            "image_points_map": IMAGE_POINTS_MAP,
+            "model_root": model_root,
+            "max_tokens": max_tokens,
+            "visualizations_dir": str(output_paths["pipeline_visualizations_dir"]),
         }
-        if cuda_devices:
-            max_workers = len(cuda_devices)
-            logger.info(f"point_agent uses one process per GPU from CUDA_VISIBLE_DEVICES: {cuda_devices}")
-        else:
-            logger.info("CUDA_VISIBLE_DEVICES is empty; point_agent uses single-process execution.")
-            max_workers = 1
     else:
         logger.info(f"Unknown model type: {model_type}")
         if progress_callback:
             progress_callback(f"Unknown model type: {model_type}")
         return
 
-    if model_type_lower not in POINT_AGENT_MODEL_TYPES:
+    if model_type_lower not in MOLMO2_PIPELINE_MODEL_TYPES:
         runtime_options = {}
-        cuda_devices = []
 
     # Load data.json file
     try:
@@ -2039,24 +2046,52 @@ def evaluate_model(
             model_type,
             model_func,
             query_field,
-            runtime_options,
             output_paths["point_on_mask_dir"],
         ))
 
-    worker_kind = "processes" if cuda_devices else "worker threads"
-    logger.info(f"Evaluating {len(pending_items)} images with {max_workers} {worker_kind}")
+    use_process_pool = False
+    worker_label = "worker threads"
+    worker_gpus = []
+    if model_type_lower in MOLMO2_PIPELINE_MODEL_TYPES:
+        worker_gpus = _get_visible_cuda_devices()
+        if worker_gpus and pending_items:
+            max_workers = min(len(worker_gpus), len(pending_items))
+            if max_workers > 1:
+                use_process_pool = True
+                worker_label = "worker processes"
+            else:
+                worker_label = "single process"
+        else:
+            max_workers = 1
+            worker_label = "single process"
+
+    logger.info(f"Evaluating {len(pending_items)} images with {max_workers} {worker_label}")
+    if worker_gpus:
+        logger.info(f"Visible CUDA devices for this run: {', '.join(worker_gpus)}")
+    _log_worker_plan(
+        model_type,
+        max_workers,
+        worker_gpus,
+        len(pending_items),
+        use_process_pool,
+        auto_worker_by_gpu=auto_worker_by_gpu,
+        requested_workers=requested_workers,
+    )
     if progress_callback:
-        progress_callback(f"Evaluating {len(pending_items)} images with {max_workers} {worker_kind}")
+        progress_callback(f"Evaluating {len(pending_items)} images with {max_workers} {worker_label}")
 
     # workers 只返回单条样本结果，父进程统一聚合和写 JSON，避免多进程并发写同一个结果文件。
     worker_results = _iter_evaluation_results(
         pending_items,
         model_name,
         max_workers,
-        cuda_devices,
         output_paths["logs_dir"],
+        runtime_options,
+        use_process_pool=use_process_pool,
+        gpu_ids=worker_gpus,
     )
-    for item_result in tqdm(worker_results, total=len(pending_items), desc=f"Evaluating {model_name}"):
+    progress_desc = "Molmo2 Gemini judge" if model_type_lower in MOLMO2_PIPELINE_MODEL_TYPES else f"Evaluating {model_name}"
+    for item_result in tqdm(worker_results, total=len(pending_items), desc=progress_desc, dynamic_ncols=True):
         item_count = _record_item_result(
             item_result,
             results,
@@ -2100,21 +2135,26 @@ def evaluate_model(
 
 def _add_common_cli_args(parser):
     parser.add_argument("--model", required=True, help="Model name to evaluate")
-    parser.add_argument("--type", required=True, choices=["openai", "gemini", "molmo", "qwen", "llava", "claude", "grok", "point_agent"], help="Model type")
+    parser.add_argument("--type", required=True, choices=["openai", "gemini", "molmo", "qwen", "llava", "claude", "grok", "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge"], help="Model type")
     parser.add_argument("--resume", action="store_true", help="Resume from previous evaluation state if available")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Start evaluation from beginning")
     parser.add_argument("--query_field", default="user_input", help="Field name for the query in the JSON data")
-    parser.add_argument("--workers", type=int, default=16, help="Number of worker threads for non-point_agent evaluation")
+    parser.add_argument("--workers", type=int, default=4, help="Number of evaluation workers for generic evaluation. The current Molmo2 Gemini fused pipeline ignores this flag and auto-scales from visible GPUs.")
     parser.add_argument("--suffix", default="", help="Suffix appended to the per-model output bucket")
     parser.add_argument("--start", type=int, default=0, help="Start index for data slicing")
     parser.add_argument("--end", type=int, default=-1, help="End index for data slicing, -1 means all remaining items")
     parser.set_defaults(resume=True)
 
 
-def _add_point_agent_cli_args(parser):
-    point_agent_group = parser.add_argument_group("point_agent options")
-    point_agent_group.add_argument("--model_root", default="", help="Local weight root. Empty means load --model as a HuggingFace repo id")
-    point_agent_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Model name used for per-item query enhancement, gemini series is recommended for best performance. ")
+def _add_molmo2_gemini_cli_args(parser):
+    molmo2_group = parser.add_argument_group("molmo2 Gemini pipeline options")
+    molmo2_group.add_argument(
+        "--model_root",
+        default="",
+        help="Optional local weight root for Molmo2. Leave empty to load/download the HuggingFace repo given by --model; when set to a directory, the code expects <model_root>/<model_short_name>.",
+    )
+    molmo2_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Gemini model used for rewrite, judge, and fallback grounding.")
+    molmo2_group.add_argument("--max_tokens", type=int, default=256, help="Max new tokens for Molmo2 generation.")
 
 
 def _get_cli_type(argv):
@@ -2129,9 +2169,8 @@ def _get_cli_type(argv):
 def _build_cli_parser(argv):
     parser = argparse.ArgumentParser(description="Evaluate model performance on point prediction tasks")
     _add_common_cli_args(parser)
-    # point_agent 专用参数只在 point_agent 模型类型下挂载，普通模型 CLI 保持干净。
-    if _get_cli_type(argv).lower() in POINT_AGENT_MODEL_TYPES:
-        _add_point_agent_cli_args(parser)
+    if _get_cli_type(argv).lower() in MOLMO2_PIPELINE_MODEL_TYPES:
+        _add_molmo2_gemini_cli_args(parser)
     return parser
 
 
@@ -2150,19 +2189,20 @@ def main():
         "llava": LLAVA_MODELS,
         "claude": CLAUDE_MODELS,
         "grok": GROK_MODELS,
-        "point_agent": POINT_AGENT_MODELS,
+        "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge": [],
     }
     
-    if args.type in valid_models and args.model not in valid_models[args.type]:
+    if args.type in valid_models and valid_models[args.type] and args.model not in valid_models[args.type]:
         logger.info(f"Warning: {args.model} is not in the list of known {args.type} models.")
         logger.info(f"Available {args.type} models: {', '.join(valid_models[args.type])}")
         return
                 
-    point_agent_kwargs = {}
-    if args.type.lower() in POINT_AGENT_MODEL_TYPES:
-        point_agent_kwargs = {
+    pipeline_kwargs = {}
+    if args.type.lower() in MOLMO2_PIPELINE_MODEL_TYPES:
+        pipeline_kwargs = {
             "model_root": args.model_root,
             "enhance_model": args.enhance_model,
+            "max_tokens": args.max_tokens,
         }
 
     # Evaluate the specified model
@@ -2175,7 +2215,7 @@ def main():
         result_suffix=args.suffix,
         start=args.start,
         end=args.end,
-        **point_agent_kwargs,
+        **pipeline_kwargs,
     )
 
 if __name__ == "__main__":
