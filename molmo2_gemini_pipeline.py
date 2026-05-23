@@ -11,12 +11,14 @@ import re
 import socket
 import tempfile
 import threading
+import traceback
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import torch
+from loguru import logger
 from runtime_warnings import suppress_known_runtime_warnings
 
 suppress_known_runtime_warnings()
@@ -68,6 +70,16 @@ MOLMO2_MODEL_ALIASES = {
 }
 GEMINI_BOX_PROMPT_VERSION = 2
 INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME = "internal_hosted_api_box_center"
+STAGE_CACHE_VERSION = 1
+PIPELINE_STAGE_ORDER = (
+    "rewrite",
+    "gemini_box",
+    "molmo2_local",
+    "gemini_judge",
+    "gemini_fallback",
+    "fallback_judge",
+    "finalize",
+)
 
 
 def _parse_json_payload(text: Any) -> Any:
@@ -537,6 +549,297 @@ def _save_debug_meta(debug_meta_path: str, debug_meta: Dict[str, Any]) -> None:
         json.dump(debug_meta, meta_file, ensure_ascii=False, indent=2)
 
 
+def _load_debug_meta(debug_meta_path: str) -> Dict[str, Any]:
+    if not debug_meta_path or not os.path.exists(debug_meta_path):
+        return {}
+    try:
+        with open(debug_meta_path, "r", encoding="utf-8") as meta_file:
+            payload = json.load(meta_file)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _default_completed_stages() -> Dict[str, bool]:
+    return {stage_name: False for stage_name in PIPELINE_STAGE_ORDER}
+
+
+def _coerce_point_pairs(point_values: Any, use_int: bool = True) -> List[List[int]]:
+    if not isinstance(point_values, list):
+        return []
+
+    normalized_points: List[List[int]] = []
+    for point_value in point_values:
+        if not isinstance(point_value, (list, tuple)) or len(point_value) < 2:
+            continue
+        try:
+            point_x = float(point_value[0])
+            point_y = float(point_value[1])
+        except (TypeError, ValueError):
+            continue
+        if use_int:
+            normalized_points.append([int(round(point_x)), int(round(point_y))])
+        else:
+            normalized_points.append([point_x, point_y])
+    return normalized_points
+
+
+def _coerce_box_list(box_values: Any, use_int: bool = True) -> List[List[int]]:
+    if not isinstance(box_values, list):
+        return []
+
+    normalized_boxes: List[List[int]] = []
+    for box_value in box_values:
+        if not isinstance(box_value, (list, tuple)) or len(box_value) < 4:
+            continue
+        try:
+            coords = [float(box_value[index]) for index in range(4)]
+        except (TypeError, ValueError):
+            continue
+        if use_int:
+            normalized_boxes.append([int(round(coord)) for coord in coords])
+        else:
+            normalized_boxes.append(coords)
+    return normalized_boxes
+
+
+def _coerce_final_point_payload(point_values: Any) -> Optional[List[Dict[str, List[float]]]]:
+    if point_values is None:
+        return None
+    if not isinstance(point_values, list):
+        return []
+
+    normalized_points: List[Dict[str, List[float]]] = []
+    for point_value in point_values:
+        coords = point_value.get("point") if isinstance(point_value, dict) else point_value
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            continue
+        try:
+            point_x = float(coords[0])
+            point_y = float(coords[1])
+        except (TypeError, ValueError):
+            continue
+        normalized_points.append({"point": [point_x, point_y]})
+    return normalized_points
+
+
+def _path_exists(path_value: str) -> bool:
+    return bool(path_value) and os.path.exists(path_value)
+
+
+def _build_stage_cache_signature(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "pipeline": "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge",
+        "question_field": state["question_field"],
+        "planner_model_name": state["planner_model_name"],
+        "resolved_model_name": state["resolved_model_name"],
+        "model_root": state["model_root"],
+        "max_tokens": state["max_tokens"],
+    }
+
+
+def _get_completed_stages(debug_meta: Dict[str, Any]) -> Dict[str, bool]:
+    completed_stages = _default_completed_stages()
+    cached_stages = debug_meta.get("completed_stages")
+    if isinstance(cached_stages, dict):
+        for stage_name in PIPELINE_STAGE_ORDER:
+            completed_stages[stage_name] = bool(cached_stages.get(stage_name))
+    return completed_stages
+
+
+def _rebuild_helper_guidance(debug_meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "box_visualization_path": str(debug_meta.get("helper_box_visualization_path") or ""),
+        "point_visualization_path": str(debug_meta.get("helper_point_visualization_path") or ""),
+        "guidance_points_xy": _coerce_point_pairs(debug_meta.get("guidance_points_xy"), use_int=True),
+        "matched_box_centers_xy": _coerce_point_pairs(debug_meta.get("matched_box_centers_xy"), use_int=True),
+        "pixel_boxes_xyxy": _coerce_box_list(debug_meta.get("pixel_boxes_xyxy"), use_int=True),
+        "helper_box_prompt": str(debug_meta.get("helper_box_prompt") or ""),
+        "helper_box_raw_response": str(debug_meta.get("helper_box_raw_response") or ""),
+        "helper_box_parsed_response": debug_meta.get("helper_box_parsed_response"),
+        "helper_box_reasoning_trace": debug_meta.get("helper_box_reasoning_trace", {}) or {},
+        "helper_box_target_resolution": debug_meta.get("helper_box_target_resolution", {}) or {},
+        "helper_box_reason": str(debug_meta.get("helper_box_reason") or ""),
+        "normalized_boxes_yxyx_0_1000": _coerce_box_list(debug_meta.get("normalized_boxes_yxyx_0_1000"), use_int=False),
+        "normalized_points_yx_0_1000": _coerce_point_pairs(debug_meta.get("normalized_points_yx_0_1000"), use_int=False),
+    }
+
+
+def _restore_stage_cache(state: Dict[str, Any]) -> Dict[str, Any]:
+    # Stage cache lives in the per-sample justify_meta.json so reruns of the same
+    # command can resume from the last finished stage instead of redoing API work.
+    if not state["runtime_options"].get("resume", False):
+        return state
+
+    cached_meta = _load_debug_meta(state["debug_meta_path"])
+    if not cached_meta:
+        return state
+    if cached_meta.get("stage_cache_version") != STAGE_CACHE_VERSION:
+        return state
+    if cached_meta.get("stage_cache_signature") != _build_stage_cache_signature(state):
+        return state
+
+    state["debug_meta"].update(cached_meta)
+    state["debug_meta"]["completed_stages"] = _get_completed_stages(state["debug_meta"])
+
+    state["enhanced_user_input"] = str(state["debug_meta"].get("enhanced_user_input") or "")
+    if state["enhanced_user_input"]:
+        state["item"]["enhanced_query"] = state["enhanced_user_input"]
+        state["item"][state["question_field"]] = state["enhanced_user_input"]
+
+    state["helper_guidance"] = _rebuild_helper_guidance(state["debug_meta"])
+    state["local_route"] = str(state["debug_meta"].get("local_route") or "")
+    state["prompt_text"] = str(state["debug_meta"].get("local_prompt_text") or "")
+    state["molmo2_response"] = str(state["debug_meta"].get("local_response_text") or "")
+    state["candidate_points"] = _coerce_point_pairs(state["debug_meta"].get("local_points"), use_int=True)
+    state["local_box_artifacts"] = {
+        "input_visualization_path": str(state["debug_meta"].get("local_input_image_path") or ""),
+        "point_visualization_path": str(state["debug_meta"].get("local_box_point_visualization_path") or ""),
+    }
+    state["local_point_only_path"] = str(state["debug_meta"].get("local_point_only_image_path") or "")
+    state["judge_point_only_path"] = str(state["debug_meta"].get("point_only_image_path") or "")
+    state["judge_prompt"] = str(state["debug_meta"].get("judge_prompt") or "")
+    state["judge_raw"] = str(state["debug_meta"].get("judge_raw") or "")
+    state["judge_result"] = state["debug_meta"].get("judge_parsed") if isinstance(state["debug_meta"].get("judge_parsed"), dict) else None
+    state["strict_accept"] = bool(state["debug_meta"].get("judge_strict_accept"))
+    state["fallback_prompt"] = str(state["debug_meta"].get("gemini_fallback_prompt") or "")
+    state["fallback_raw"] = str(state["debug_meta"].get("gemini_fallback_raw") or "")
+    state["fallback_points"] = _coerce_point_pairs(state["debug_meta"].get("gemini_fallback_points"), use_int=True)
+    state["fallback_viz_path"] = str(state["debug_meta"].get("gemini_first_point_only_image_path") or "")
+    state["fallback_judge_raw"] = str(state["debug_meta"].get("gemini_fallback_final_judge_raw") or "")
+    fallback_judge_parsed = state["debug_meta"].get("gemini_fallback_final_judge_parsed")
+    state["fallback_judge_result"] = fallback_judge_parsed if isinstance(fallback_judge_parsed, dict) else None
+    state["fallback_strict_accept"] = bool(state["debug_meta"].get("gemini_fallback_accept"))
+    state["final_decision"] = str(state["debug_meta"].get("final_decision") or "")
+
+    completed_stages = _get_completed_stages(state["debug_meta"])
+    if completed_stages["finalize"]:
+        state["final_points"] = _coerce_final_point_payload(state["debug_meta"].get("final_response"))
+    elif completed_stages["molmo2_local"] and not state["original_points_in_image"]:
+        state["final_points"] = _coerce_final_point_payload(state["debug_meta"].get("final_response"))
+    elif completed_stages["gemini_judge"] and state["final_decision"] == "judge_accept_keep_molmo2":
+        state["final_points"] = _coerce_final_point_payload(state["debug_meta"].get("final_response"))
+    elif completed_stages["gemini_fallback"] and state["final_decision"] == "fallback_empty_keep_molmo2":
+        state["final_points"] = _coerce_final_point_payload(state["debug_meta"].get("final_response"))
+    elif completed_stages["fallback_judge"] and state["final_decision"] in {"fallback_accept_use_gemini", "fallback_reject_keep_molmo2"}:
+        state["final_points"] = _coerce_final_point_payload(state["debug_meta"].get("final_response"))
+
+    state["pipeline_error"] = ""
+    return state
+
+
+def _save_stage_cache(state: Dict[str, Any], completed_stage: Optional[str] = None) -> Dict[str, Any]:
+    debug_meta = state.get("debug_meta")
+    if not isinstance(debug_meta, dict):
+        return state
+
+    completed_stages = _get_completed_stages(debug_meta)
+    if completed_stage:
+        completed_stages[completed_stage] = True
+    debug_meta["completed_stages"] = completed_stages
+    debug_meta["stage_cache_version"] = STAGE_CACHE_VERSION
+    debug_meta["stage_cache_signature"] = _build_stage_cache_signature(state)
+    debug_meta["enhanced_user_input"] = state.get("enhanced_user_input", "")
+    debug_meta["local_route"] = state.get("local_route", "")
+    debug_meta["local_prompt_text"] = state.get("prompt_text", "")
+    debug_meta["local_response_text"] = state.get("molmo2_response", "")
+    debug_meta["local_points"] = state.get("candidate_points", [])
+    debug_meta["judge_prompt"] = state.get("judge_prompt", "")
+    debug_meta["judge_raw"] = state.get("judge_raw", "")
+    debug_meta["judge_parsed"] = state.get("judge_result")
+    debug_meta["judge_strict_accept"] = state.get("strict_accept")
+    debug_meta["gemini_fallback_prompt"] = state.get("fallback_prompt", "")
+    debug_meta["gemini_fallback_raw"] = state.get("fallback_raw", "")
+    debug_meta["gemini_fallback_points"] = state.get("fallback_points", [])
+    debug_meta["gemini_fallback_final_judge_raw"] = state.get("fallback_judge_raw", "")
+    debug_meta["gemini_fallback_final_judge_parsed"] = state.get("fallback_judge_result")
+    debug_meta["gemini_fallback_accept"] = state.get("fallback_strict_accept")
+    debug_meta["final_decision"] = state.get("final_decision", "")
+    debug_meta["final_response"] = state.get("final_points", []) if state.get("final_points") is not None else []
+    debug_meta["pipeline_error"] = state.get("pipeline_error", "")
+    debug_meta["pipeline_error_reason"] = debug_meta.get("pipeline_error_reason", "") if state.get("pipeline_error") else ""
+    debug_meta["pipeline_error_traceback"] = (
+        debug_meta.get("pipeline_error_traceback", "") if state.get("pipeline_error") else ""
+    )
+    _save_debug_meta(state["debug_meta_path"], debug_meta)
+    return state
+
+
+def _invalidate_stage_cache_from(state: Dict[str, Any], stage_name: str) -> Dict[str, Any]:
+    debug_meta = state.get("debug_meta")
+    if not isinstance(debug_meta, dict):
+        return state
+
+    clear_from_current = False
+    completed_stages = _get_completed_stages(debug_meta)
+    for cached_stage_name in PIPELINE_STAGE_ORDER:
+        if cached_stage_name == stage_name:
+            clear_from_current = True
+        if clear_from_current:
+            completed_stages[cached_stage_name] = False
+    debug_meta["completed_stages"] = completed_stages
+    state["final_points"] = None
+    state["final_decision"] = ""
+    state["pipeline_error"] = ""
+    debug_meta["final_decision"] = ""
+    debug_meta["final_response"] = []
+    debug_meta["pipeline_error"] = ""
+    debug_meta["pipeline_error_reason"] = ""
+    debug_meta["pipeline_error_traceback"] = ""
+    return state
+
+
+def _stage_cache_ready(state: Dict[str, Any], stage_name: str) -> bool:
+    completed_stages = _get_completed_stages(state.get("debug_meta", {}))
+    if not completed_stages.get(stage_name):
+        return False
+
+    if stage_name == "rewrite":
+        return bool(state.get("enhanced_user_input"))
+    if stage_name == "gemini_box":
+        return (
+            bool(state["debug_meta"].get("helper_box_prompt"))
+            or bool(state["debug_meta"].get("helper_box_raw_response"))
+            or bool(state["debug_meta"].get("helper_box_reason"))
+        )
+    if stage_name == "molmo2_local":
+        if not state["original_points_in_image"]:
+            return bool(state.get("molmo2_response")) and state.get("final_points") is not None
+        return bool(state.get("molmo2_response")) and _path_exists(state.get("judge_point_only_path", ""))
+    if stage_name == "gemini_judge":
+        return (
+            state.get("strict_accept", False)
+            or isinstance(state.get("judge_result"), dict)
+            or bool(state.get("judge_raw"))
+            or bool(state["debug_meta"].get("judge_hard_reject_reason"))
+        )
+    if stage_name == "gemini_fallback":
+        return (
+            state.get("final_decision") == "fallback_empty_keep_molmo2"
+            or bool(state.get("fallback_raw"))
+            or (bool(state.get("fallback_points")) and _path_exists(state.get("fallback_viz_path", "")))
+        )
+    if stage_name == "fallback_judge":
+        return (
+            state.get("final_decision") in {"fallback_accept_use_gemini", "fallback_reject_keep_molmo2"}
+            or isinstance(state.get("fallback_judge_result"), dict)
+            or bool(state.get("fallback_judge_raw"))
+            or state["debug_meta"].get("gemini_fallback_accept") is not None
+        )
+    if stage_name == "finalize":
+        return state.get("final_points") is not None and bool(state.get("final_decision"))
+    return False
+
+
+def _begin_stage(state: Dict[str, Any], stage_name: str) -> bool:
+    if state.get("pipeline_error"):
+        return False
+    if _stage_cache_ready(state, stage_name):
+        return False
+    _invalidate_stage_cache_from(state, stage_name)
+    return True
+
+
 def _points_to_float_payload(points: List[List[int]]) -> List[Dict[str, List[float]]]:
     return [{"point": [float(point_x), float(point_y)]} for point_x, point_y in points]
 
@@ -822,7 +1125,11 @@ def _run_internal_gemini_box_grounding(
         raw_response = _call_gemini(api_key, base_url, planner_model_name, prompt_text, [image_path])
     except Exception as error:
         if _is_network_error(error):
+            logger.exception(
+                f"Gemini helper box grounding network error for image={item.get('image_filename') or image_path}"
+            )
             return {}, True
+        logger.exception(f"Gemini helper box grounding failed for image={item.get('image_filename') or image_path}")
         raw_response = ""
 
     parsed_payload, normalized_boxes, normalized_points, pixel_boxes, pixel_points = _normalize_gemini_box_response(
@@ -932,13 +1239,18 @@ def _load_molmo2_official_model(model_name: str, model_root: str):
     if model_root:
         root_path = Path(model_root).expanduser()
         if root_path.is_dir():
-            resolved_path = str((root_path / resolved_name.split("/")[-1]).resolve())
-            if not Path(resolved_path).exists():
+            repo_relative_path = Path(*resolved_name.split("/"))
+            expected_path = root_path / repo_relative_path
+            if expected_path.exists():
+                resolved_path = str(expected_path.resolve())
+            elif (root_path / "config.json").exists():
+                resolved_path = str(root_path.resolve())
+            else:
                 raise FileNotFoundError(
                     "Molmo2 local weights not found at "
-                    f"{resolved_path}. Leave --model_root empty to load {resolved_name} "
+                    f"{expected_path}. Leave --model_root empty to load {resolved_name} "
                     "from HuggingFace, or place the model under "
-                    f"{root_path}/{resolved_name.split('/')[-1]}."
+                    f"{expected_path}."
                 )
         elif root_path.exists():
             resolved_path = str(root_path.resolve())
@@ -1413,16 +1725,97 @@ def _is_network_error(error: BaseException) -> bool:
     return False
 
 
-def call_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge(
+def _build_initial_debug_meta(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "pipeline": "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge",
+        "stage_cache_version": STAGE_CACHE_VERSION,
+        "stage_cache_signature": _build_stage_cache_signature(state),
+        "completed_stages": _default_completed_stages(),
+        "image_path": state["image_path"],
+        "image_filename": state["image_filename"],
+        "category": state["category"],
+        "question_field": state["question_field"],
+        "raw_user_input": state["raw_user_input"],
+        "enhanced_user_input": "",
+        "local_route": "",
+        "local_prompt_source_pipeline": "molmo2_guidance_dualquery_refpoint_hybrid",
+        "judge_requires_reference_points": True,
+        "molmo2_guidance_source_field": INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME,
+        "molmo2_with_box_source_field": INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME,
+        "helper_sidecar_path": "",
+        "helper_visualization_path": "",
+        "guidance_points_xy": [],
+        "matched_box_centers_xy": [],
+        "pixel_boxes_xyxy": [],
+        "helper_box_prompt_version": GEMINI_BOX_PROMPT_VERSION,
+        "helper_box_prompt": "",
+        "helper_box_raw_response": "",
+        "helper_box_parsed_response": None,
+        "helper_box_reasoning_trace": {},
+        "helper_box_target_resolution": {},
+        "helper_box_reason": "",
+        "normalized_boxes_yxyx_0_1000": [],
+        "normalized_points_yx_0_1000": [],
+        "helper_box_visualization_path": "",
+        "helper_point_visualization_path": "",
+        "original_points_in_image": state["original_points_in_image"],
+        "local_prompt_text": "",
+        "local_input_image_path": "",
+        "local_box_point_visualization_path": "",
+        "local_point_only_image_path": "",
+        "point_only_image_path": "",
+        "local_response_text": "",
+        "local_points": [],
+        "judge_skipped": False,
+        "judge_skip_reason": "",
+        "judge_prompt": "",
+        "judge_hard_reject_reason": "",
+        "judge_raw": "",
+        "judge_parsed": None,
+        "judge_model_accept": None,
+        "judge_accept": None,
+        "judge_strict_accept": None,
+        "judge_reason": "",
+        "judge_verification_trace": {},
+        "gemini_fallback_prompt": "",
+        "gemini_fallback_raw": "",
+        "gemini_fallback_points": [],
+        "gemini_fallback_response_text": "",
+        "gemini_first_point_only_image_path": "",
+        "gemini_fallback_final_judge_raw": "",
+        "gemini_fallback_final_judge_parsed": None,
+        "gemini_fallback_final_judge_verification_trace": {},
+        "gemini_fallback_accept": None,
+        "pipeline_error": "",
+        "pipeline_error_reason": "",
+        "pipeline_error_traceback": "",
+        "final_decision": "",
+        "final_response": [],
+    }
+
+
+def _mark_pipeline_error(
+    state: Dict[str, Any],
+    error_code: str,
+    reason: str = "",
+    traceback_text: str = "",
+) -> Dict[str, Any]:
+    state["pipeline_error"] = error_code
+    debug_meta = state.get("debug_meta")
+    if isinstance(debug_meta, dict):
+        debug_meta["pipeline_error"] = error_code
+        debug_meta["pipeline_error_reason"] = reason or error_code
+        debug_meta["pipeline_error_traceback"] = traceback_text
+    return _save_stage_cache(state)
+
+
+def build_molmo2_gemini_pipeline_state(
     image_path: str,
-    object_name: str,
     model_name: str = "allenai/Molmo2-4B",
     category: Optional[str] = None,
     item_ctx: Optional[Dict[str, Any]] = None,
     runtime_options: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, List[float]]]:
-    """Rewrite first, then run the refpoint-hybrid Molmo2 route, and only judge reference-point samples."""
-    del object_name
+) -> Dict[str, Any]:
     options = runtime_options or {}
     item = item_ctx if item_ctx is not None else {}
     item["image_path"] = image_path
@@ -1454,299 +1847,528 @@ def call_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge(
         or os.getenv("API_MODEL_NAME")
         or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.1-pro-preview")
     ).strip()
-
-    enhanced_user_input = call_transform_gemini(
-        image_path=image_path,
-        object_name=raw_user_input,
-        model_name=planner_model_name,
-        category=item.get("category", ""),
-        item_ctx=item,
-        runtime_options={
-            "image_points_map": image_points_map,
-            "api_key": api_key,
-            "base_url": base_url,
-            "enhance_model": planner_model_name,
-        },
-    ).strip()
-    if not enhanced_user_input:
-        return []
-
-    item["enhanced_query"] = enhanced_user_input
-    item[question_field] = enhanced_user_input
-
-    with Image.open(image_path) as source_image:
-        image = source_image.convert("RGB")
-        image_w, image_h = image.size
-
     resolved_model_name = MOLMO2_MODEL_ALIASES.get(str(model_name or "").strip(), str(model_name or "").strip()) or "allenai/Molmo2-4B"
     max_tokens = int(options.get("max_tokens", 256))
     model_root = str(options.get("model_root", "")).strip()
 
-    # PointBench 这里把 hosted Gemini box-center helper 直接内嵌到同一条 pipeline，
-    # 不再依赖外部预先跑好的 source_field 目录。
-    helper_guidance, helper_network_error = _run_internal_gemini_box_grounding(
-        image_path,
-        image,
-        image_w,
-        image_h,
-        item,
-        question_field,
-        planner_model_name,
-        api_key,
-        base_url,
-        category_dir,
-        image_stem,
-    )
-    if helper_network_error:
-        return []
+    with Image.open(image_path) as source_image:
+        image_w, image_h = source_image.size
 
-    # 这里沿用原仓库 hybrid 的路由规则：有 reference points 时优先走 no-label box 分支，
-    # 但如果当前样本这轮 Gemini helper 没给出 box，prompt 会自动回退成 dualquery 版本。
-    if item.get("original_points_in_image", []) or []:
-        local_route = "refpoint_nolabel_box"
-        prompt_text = _build_refpoint_box_explained_nolabel_prompt(
-            raw_user_input,
-            enhanced_user_input,
-            question_field,
-            helper_guidance.get("pixel_boxes_xyxy", []) or [],
-            item.get("category", ""),
-            helper_guidance.get("guidance_points_xy", []) or [],
-        )
-        local_input_image = _build_nolabel_box_overlay_image(
-            image_path,
-            helper_guidance.get("pixel_boxes_xyxy", []) or [],
-        )
-    else:
-        local_route = "dualquery_prompt"
-        prompt_text = _build_dualquery_guidance_prompt(
-            raw_user_input,
-            enhanced_user_input,
-            question_field,
-            helper_guidance.get("guidance_points_xy", []) or [],
-            item.get("category", ""),
-        )
-        local_input_image = image.copy()
-
-    try:
-        molmo2_response = _run_molmo2_item(
-            image_path,
-            prompt_text,
-            resolved_model_name,
-            model_root,
-            max_tokens,
-            image_override=local_input_image,
-        )
-    except Exception:
-        return []
-
-    candidate_points = _extract_molmo2_points(molmo2_response, image_w, image_h)
-    if item.get("category") != "counting" and len(candidate_points) > 1 and not _query_requests_multiple(raw_user_input, enhanced_user_input):
-        candidate_points = candidate_points[:1]
-
-    if local_route == "refpoint_nolabel_box":
-        local_box_artifacts = _save_hybrid_box_debug_artifacts(
-            local_input_image,
-            candidate_points,
-            category_dir,
-            image_stem,
-        )
-    else:
-        local_box_artifacts = {
-            "input_visualization_path": "",
-            "point_visualization_path": "",
-        }
-    local_point_only_path = _save_points_visualization(
-        image,
-        candidate_points,
-        item.get("original_points_in_image", []) or [],
-        category_dir,
-        f"{image_stem}_points_only.jpg",
-    )
-    judge_viz = _build_judge_visualization(image, candidate_points, item.get("original_points_in_image", []) or [])
-    judge_point_only_path = unicodedata.normalize("NFC", os.path.join(category_dir, f"{image_stem}_judge_points_only.jpg"))
-    judge_viz.save(judge_point_only_path)
-
-    debug_meta: Dict[str, Any] = {
-        "pipeline": "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge",
+    state = {
+        "item": item,
+        "runtime_options": options,
         "image_path": image_path,
         "image_filename": item["image_filename"],
         "category": item.get("category", ""),
         "question_field": question_field,
+        "image_stem": image_stem,
+        "category_dir": category_dir,
+        "debug_meta_path": debug_meta_path,
         "raw_user_input": raw_user_input,
-        "enhanced_user_input": enhanced_user_input,
-        "local_route": local_route,
-        "local_prompt_source_pipeline": "molmo2_guidance_dualquery_refpoint_hybrid",
-        "judge_requires_reference_points": True,
-        "molmo2_guidance_source_field": INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME,
-        "molmo2_with_box_source_field": INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME,
-        "helper_sidecar_path": "",
-        "helper_visualization_path": helper_guidance.get("box_visualization_path", ""),
-        "guidance_points_xy": helper_guidance.get("guidance_points_xy", []) or [],
-        "matched_box_centers_xy": helper_guidance.get("matched_box_centers_xy", []) or [],
-        "pixel_boxes_xyxy": helper_guidance.get("pixel_boxes_xyxy", []) or [],
-        "helper_box_prompt_version": GEMINI_BOX_PROMPT_VERSION,
-        "helper_box_prompt": helper_guidance.get("helper_box_prompt", ""),
-        "helper_box_raw_response": helper_guidance.get("helper_box_raw_response", ""),
-        "helper_box_parsed_response": helper_guidance.get("helper_box_parsed_response"),
-        "helper_box_reasoning_trace": helper_guidance.get("helper_box_reasoning_trace", {}),
-        "helper_box_target_resolution": helper_guidance.get("helper_box_target_resolution", {}),
-        "helper_box_reason": helper_guidance.get("helper_box_reason", ""),
-        "normalized_boxes_yxyx_0_1000": helper_guidance.get("normalized_boxes_yxyx_0_1000", []) or [],
-        "normalized_points_yx_0_1000": helper_guidance.get("normalized_points_yx_0_1000", []) or [],
-        "helper_box_visualization_path": helper_guidance.get("box_visualization_path", ""),
-        "helper_point_visualization_path": helper_guidance.get("point_visualization_path", ""),
-        "original_points_in_image": item.get("original_points_in_image", []) or [],
-        "local_prompt_text": prompt_text,
-        "local_input_image_path": local_box_artifacts["input_visualization_path"],
-        "local_box_point_visualization_path": local_box_artifacts["point_visualization_path"],
-        "local_point_only_image_path": local_point_only_path,
-        "point_only_image_path": judge_point_only_path,
-        "local_response_text": molmo2_response,
-        "local_points": candidate_points,
+        "api_key": api_key,
+        "base_url": base_url,
+        "planner_model_name": planner_model_name,
+        "resolved_model_name": resolved_model_name,
+        "max_tokens": max_tokens,
+        "model_root": model_root,
+        "image_points_map": image_points_map,
+        "original_points_info": original_points_info,
+        "original_points_in_image": original_points_in_image,
+        "image_w": image_w,
+        "image_h": image_h,
+        "enhanced_user_input": "",
+        "helper_guidance": {},
+        "local_route": "",
+        "prompt_text": "",
+        "molmo2_response": "",
+        "candidate_points": [],
+        "local_box_artifacts": {
+            "input_visualization_path": "",
+            "point_visualization_path": "",
+        },
+        "local_point_only_path": "",
+        "judge_point_only_path": "",
+        "judge_prompt": "",
+        "judge_raw": "",
+        "judge_result": None,
+        "strict_accept": False,
+        "fallback_prompt": "",
+        "fallback_raw": "",
+        "fallback_points": [],
+        "fallback_viz_path": "",
+        "fallback_judge_raw": "",
+        "fallback_judge_result": None,
+        "fallback_strict_accept": False,
+        "final_points": None,
+        "final_decision": "",
+        "pipeline_error": "",
     }
+    state["debug_meta"] = _build_initial_debug_meta(state)
+    return _restore_stage_cache(state)
 
-    if not (item.get("original_points_in_image", []) or []):
-        final_points = _points_to_float_payload(candidate_points)
-        debug_meta.update(
-            {
-                "judge_skipped": True,
-                "judge_skip_reason": "no_reference_points",
-                "judge_raw": "",
-                "judge_parsed": None,
-                "judge_model_accept": None,
-                "judge_accept": None,
-                "judge_strict_accept": None,
-                "judge_reason": "Skipped Gemini judge because no reference points were provided for this sample.",
-                "judge_verification_trace": {},
-                "gemini_fallback_prompt": "",
-                "gemini_fallback_raw": "",
-                "gemini_fallback_points": [],
-                "gemini_fallback_response_text": "",
-                "gemini_first_point_only_image_path": "",
-                "gemini_fallback_final_judge_raw": "",
-                "gemini_fallback_final_judge_parsed": None,
-                "gemini_fallback_final_judge_verification_trace": {},
-                "final_decision": "skip_gemini_keep_molmo2_no_reference_point",
-                "final_response": final_points,
-            }
-        )
-        _save_debug_meta(debug_meta_path, debug_meta)
-        return final_points
 
-    judge_prompt = _build_molmo2_judge_prompt(raw_user_input, enhanced_user_input, question_field)
-    hard_reject_reason = _get_hard_reject_reason(candidate_points, image_w, image_h)
-    if hard_reject_reason:
-        judge_raw = ""
-        judge_result = _make_rejected_judge_result(hard_reject_reason)
-    else:
-        try:
-            judge_raw = _call_gemini(api_key, base_url, planner_model_name, judge_prompt, [judge_point_only_path])
-            judge_result = _parse_json_payload(judge_raw)
-        except Exception as error:
-            if _is_network_error(error):
-                return []
-            return []
-        if not isinstance(judge_result, dict):
-            judge_result = None
+def run_molmo2_gemini_rewrite_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not _begin_stage(state, "rewrite"):
+        return state
 
-    strict_accept = _get_strict_judge_accept(judge_result, hard_reject_reason)
-    debug_meta.update(
-        {
-            "judge_skipped": False,
-            "judge_prompt": judge_prompt,
-            "judge_hard_reject_reason": hard_reject_reason,
-            "judge_raw": judge_raw,
-            "judge_parsed": judge_result,
-            "judge_model_accept": judge_result.get("accept") if isinstance(judge_result, dict) else None,
-            "judge_accept": judge_result.get("accept") if isinstance(judge_result, dict) else None,
-            "judge_strict_accept": strict_accept,
-            "judge_reason": judge_result.get("reason", "") if isinstance(judge_result, dict) else "",
-            "judge_verification_trace": judge_result.get("verification_trace", {}) if isinstance(judge_result, dict) else {},
-        }
-    )
-
-    if strict_accept:
-        final_points = _points_to_float_payload(candidate_points)
-        debug_meta["final_decision"] = "judge_accept_keep_molmo2"
-        debug_meta["final_response"] = final_points
-        _save_debug_meta(debug_meta_path, debug_meta)
-        return final_points
-
-    fallback_prompt = _build_fallback_grounding_prompt(raw_user_input, enhanced_user_input, question_field)
     try:
-        fallback_raw = _call_gemini(api_key, base_url, planner_model_name, fallback_prompt, [image_path])
-    except Exception as error:
-        if _is_network_error(error):
-            return []
-        return []
+        enhanced_user_input = call_transform_gemini(
+            image_path=state["image_path"],
+            object_name=state["raw_user_input"],
+            model_name=state["planner_model_name"],
+            category=state["category"],
+            item_ctx=state["item"],
+            runtime_options={
+                "image_points_map": state["image_points_map"],
+                "api_key": state["api_key"],
+                "base_url": state["base_url"],
+                "enhance_model": state["planner_model_name"],
+            },
+        ).strip()
+    except Exception:
+        traceback_text = traceback.format_exc()
+        logger.exception(
+            f"Gemini rewrite failed for image={state['image_filename']}, category={state['category']}"
+        )
+        return _mark_pipeline_error(
+            state,
+            "rewrite_error",
+            "Gemini rewrite failed.",
+            traceback_text,
+        )
+    if not enhanced_user_input:
+        return _mark_pipeline_error(state, "rewrite_empty", "Gemini rewrite returned empty text.")
 
-    fallback_parse_category = "counting" if _query_requests_multiple(raw_user_input, enhanced_user_input) else ""
-    fallback_points = _extract_gemini_point_response(fallback_raw, image_w, image_h, fallback_parse_category)
-    debug_meta["gemini_fallback_prompt"] = fallback_prompt
-    debug_meta["gemini_fallback_raw"] = fallback_raw
-    debug_meta["gemini_fallback_points"] = fallback_points
-    debug_meta["gemini_fallback_response_text"] = _normalize_final_text_no_markdown(fallback_points)
+    state["enhanced_user_input"] = enhanced_user_input
+    state["item"]["enhanced_query"] = enhanced_user_input
+    state["item"][state["question_field"]] = enhanced_user_input
+    state["debug_meta"]["enhanced_user_input"] = enhanced_user_input
+    return _save_stage_cache(state, "rewrite")
 
-    if not fallback_points:
-        final_points = _points_to_float_payload(candidate_points)
-        debug_meta["final_decision"] = "fallback_empty_keep_molmo2"
-        debug_meta["final_response"] = final_points
-        _save_debug_meta(debug_meta_path, debug_meta)
-        return final_points
 
-    fallback_viz_path = _save_points_visualization(
-        image,
-        fallback_points,
-        item.get("original_points_in_image", []) or [],
-        category_dir,
-        f"{image_stem}_gemini_first_points_only.jpg",
+def run_molmo2_gemini_box_grounding_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not _begin_stage(state, "gemini_box"):
+        return state
+
+    with Image.open(state["image_path"]) as source_image:
+        image = source_image.convert("RGB")
+    try:
+        helper_guidance, helper_network_error = _run_internal_gemini_box_grounding(
+            state["image_path"],
+            image,
+            state["image_w"],
+            state["image_h"],
+            state["item"],
+            state["question_field"],
+            state["planner_model_name"],
+            state["api_key"],
+            state["base_url"],
+            state["category_dir"],
+            state["image_stem"],
+        )
+    finally:
+        image.close()
+
+    if helper_network_error:
+        return _mark_pipeline_error(
+            state,
+            "helper_network_error",
+            "Gemini helper box grounding hit a network error.",
+        )
+
+    state["helper_guidance"] = helper_guidance
+    debug_meta = state["debug_meta"]
+    debug_meta["helper_visualization_path"] = helper_guidance.get("box_visualization_path", "")
+    debug_meta["guidance_points_xy"] = helper_guidance.get("guidance_points_xy", []) or []
+    debug_meta["matched_box_centers_xy"] = helper_guidance.get("matched_box_centers_xy", []) or []
+    debug_meta["pixel_boxes_xyxy"] = helper_guidance.get("pixel_boxes_xyxy", []) or []
+    debug_meta["helper_box_prompt"] = helper_guidance.get("helper_box_prompt", "")
+    debug_meta["helper_box_raw_response"] = helper_guidance.get("helper_box_raw_response", "")
+    debug_meta["helper_box_parsed_response"] = helper_guidance.get("helper_box_parsed_response")
+    debug_meta["helper_box_reasoning_trace"] = helper_guidance.get("helper_box_reasoning_trace", {})
+    debug_meta["helper_box_target_resolution"] = helper_guidance.get("helper_box_target_resolution", {})
+    debug_meta["helper_box_reason"] = helper_guidance.get("helper_box_reason", "")
+    debug_meta["normalized_boxes_yxyx_0_1000"] = helper_guidance.get("normalized_boxes_yxyx_0_1000", []) or []
+    debug_meta["normalized_points_yx_0_1000"] = helper_guidance.get("normalized_points_yx_0_1000", []) or []
+    debug_meta["helper_box_visualization_path"] = helper_guidance.get("box_visualization_path", "")
+    debug_meta["helper_point_visualization_path"] = helper_guidance.get("point_visualization_path", "")
+    return _save_stage_cache(state, "gemini_box")
+
+
+def run_molmo2_gemini_local_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not _begin_stage(state, "molmo2_local"):
+        return state
+
+    with Image.open(state["image_path"]) as source_image:
+        image = source_image.convert("RGB")
+
+    local_input_image: Optional[Image.Image] = None
+    judge_viz: Optional[Image.Image] = None
+    try:
+        if state["original_points_in_image"]:
+            state["local_route"] = "refpoint_nolabel_box"
+            state["prompt_text"] = _build_refpoint_box_explained_nolabel_prompt(
+                state["raw_user_input"],
+                state["enhanced_user_input"],
+                state["question_field"],
+                state["helper_guidance"].get("pixel_boxes_xyxy", []) or [],
+                state["category"],
+                state["helper_guidance"].get("guidance_points_xy", []) or [],
+            )
+            local_input_image = _build_nolabel_box_overlay_image(
+                state["image_path"],
+                state["helper_guidance"].get("pixel_boxes_xyxy", []) or [],
+            )
+        else:
+            state["local_route"] = "dualquery_prompt"
+            state["prompt_text"] = _build_dualquery_guidance_prompt(
+                state["raw_user_input"],
+                state["enhanced_user_input"],
+                state["question_field"],
+                state["helper_guidance"].get("guidance_points_xy", []) or [],
+                state["category"],
+            )
+            local_input_image = image.copy()
+
+        try:
+            state["molmo2_response"] = _run_molmo2_item(
+                state["image_path"],
+                state["prompt_text"],
+                state["resolved_model_name"],
+                state["model_root"],
+                state["max_tokens"],
+                image_override=local_input_image,
+            )
+        except Exception as error:
+            traceback_text = traceback.format_exc()
+            logger.exception(
+                f"Molmo2 local stage failed for image={state['image_filename']}, "
+                f"model={state['resolved_model_name']}, model_root={state['model_root'] or '<huggingface-auto-download>'}"
+            )
+            return _mark_pipeline_error(
+                state,
+                "local_molmo_error",
+                f"Molmo2 local stage failed: {error}",
+                traceback_text,
+            )
+
+        candidate_points = _extract_molmo2_points(state["molmo2_response"], state["image_w"], state["image_h"])
+        if state["category"] != "counting" and len(candidate_points) > 1 and not _query_requests_multiple(state["raw_user_input"], state["enhanced_user_input"]):
+            candidate_points = candidate_points[:1]
+        state["candidate_points"] = candidate_points
+
+        if state["local_route"] == "refpoint_nolabel_box":
+            state["local_box_artifacts"] = _save_hybrid_box_debug_artifacts(
+                local_input_image,
+                candidate_points,
+                state["category_dir"],
+                state["image_stem"],
+            )
+
+        state["local_point_only_path"] = _save_points_visualization(
+            image,
+            candidate_points,
+            state["original_points_in_image"],
+            state["category_dir"],
+            f"{state['image_stem']}_points_only.jpg",
+        )
+        judge_viz = _build_judge_visualization(image, candidate_points, state["original_points_in_image"])
+        state["judge_point_only_path"] = unicodedata.normalize("NFC", os.path.join(state["category_dir"], f"{state['image_stem']}_judge_points_only.jpg"))
+        judge_viz.save(state["judge_point_only_path"])
+
+        debug_meta = state["debug_meta"]
+        debug_meta["enhanced_user_input"] = state["enhanced_user_input"]
+        debug_meta["local_route"] = state["local_route"]
+        debug_meta["local_prompt_text"] = state["prompt_text"]
+        debug_meta["local_input_image_path"] = state["local_box_artifacts"]["input_visualization_path"]
+        debug_meta["local_box_point_visualization_path"] = state["local_box_artifacts"]["point_visualization_path"]
+        debug_meta["local_point_only_image_path"] = state["local_point_only_path"]
+        debug_meta["point_only_image_path"] = state["judge_point_only_path"]
+        debug_meta["local_response_text"] = state["molmo2_response"]
+        debug_meta["local_points"] = candidate_points
+
+        if not state["original_points_in_image"]:
+            state["final_points"] = _points_to_float_payload(candidate_points)
+            state["final_decision"] = "skip_gemini_keep_molmo2_no_reference_point"
+            debug_meta["judge_skipped"] = True
+            debug_meta["judge_skip_reason"] = "no_reference_points"
+            debug_meta["judge_reason"] = "Skipped Gemini judge because no reference points were provided for this sample."
+            debug_meta["final_decision"] = state["final_decision"]
+            debug_meta["final_response"] = state["final_points"]
+    finally:
+        if judge_viz is not None:
+            judge_viz.close()
+        if local_input_image is not None:
+            local_input_image.close()
+        image.close()
+
+    return _save_stage_cache(state, "molmo2_local")
+
+
+def run_molmo2_gemini_judge_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("pipeline_error") or not state["original_points_in_image"]:
+        return state
+    if not _begin_stage(state, "gemini_judge"):
+        return state
+    if state.get("final_points") is not None:
+        return state
+
+    state["judge_prompt"] = _build_molmo2_judge_prompt(
+        state["raw_user_input"],
+        state["enhanced_user_input"],
+        state["question_field"],
     )
-    debug_meta["gemini_first_point_only_image_path"] = fallback_viz_path
-
-    fallback_hard_reject_reason = _get_hard_reject_reason(fallback_points, image_w, image_h)
-    if fallback_hard_reject_reason:
-        fallback_judge_raw = ""
-        fallback_judge_result = _make_rejected_judge_result(fallback_hard_reject_reason)
+    hard_reject_reason = _get_hard_reject_reason(state["candidate_points"], state["image_w"], state["image_h"])
+    if hard_reject_reason:
+        state["judge_raw"] = ""
+        state["judge_result"] = _make_rejected_judge_result(hard_reject_reason)
     else:
         try:
-            fallback_judge_raw = _call_gemini(api_key, base_url, planner_model_name, judge_prompt, [fallback_viz_path])
-            fallback_judge_result = _parse_json_payload(fallback_judge_raw)
+            state["judge_raw"] = _call_gemini(
+                state["api_key"],
+                state["base_url"],
+                state["planner_model_name"],
+                state["judge_prompt"],
+                [state["judge_point_only_path"]],
+            )
+            state["judge_result"] = _parse_json_payload(state["judge_raw"])
         except Exception as error:
+            traceback_text = traceback.format_exc()
             if _is_network_error(error):
-                return []
-            return []
-        if not isinstance(fallback_judge_result, dict):
-            fallback_judge_result = None
+                logger.exception(f"Gemini judge network error for image={state['image_filename']}")
+                return _mark_pipeline_error(
+                    state,
+                    "judge_network_error",
+                    "Gemini judge hit a network error.",
+                    traceback_text,
+                )
+            logger.exception(f"Gemini judge failed for image={state['image_filename']}")
+            return _mark_pipeline_error(
+                state,
+                "judge_error",
+                f"Gemini judge failed: {error}",
+                traceback_text,
+            )
+        if not isinstance(state["judge_result"], dict):
+            state["judge_result"] = None
 
-    fallback_strict_accept = _get_strict_judge_accept(fallback_judge_result, fallback_hard_reject_reason)
-    debug_meta["gemini_fallback_final_judge_raw"] = fallback_judge_raw
-    debug_meta["gemini_fallback_final_judge_parsed"] = fallback_judge_result
-    debug_meta["gemini_fallback_final_judge_verification_trace"] = (
-        fallback_judge_result.get("verification_trace", {}) if isinstance(fallback_judge_result, dict) else {}
+    state["strict_accept"] = _get_strict_judge_accept(state["judge_result"], hard_reject_reason)
+    debug_meta = state["debug_meta"]
+    debug_meta["judge_skipped"] = False
+    debug_meta["judge_prompt"] = state["judge_prompt"]
+    debug_meta["judge_hard_reject_reason"] = hard_reject_reason
+    debug_meta["judge_raw"] = state["judge_raw"]
+    debug_meta["judge_parsed"] = state["judge_result"]
+    debug_meta["judge_model_accept"] = state["judge_result"].get("accept") if isinstance(state["judge_result"], dict) else None
+    debug_meta["judge_accept"] = state["judge_result"].get("accept") if isinstance(state["judge_result"], dict) else None
+    debug_meta["judge_strict_accept"] = state["strict_accept"]
+    debug_meta["judge_reason"] = state["judge_result"].get("reason", "") if isinstance(state["judge_result"], dict) else ""
+    debug_meta["judge_verification_trace"] = state["judge_result"].get("verification_trace", {}) if isinstance(state["judge_result"], dict) else {}
+
+    if state["strict_accept"]:
+        state["final_points"] = _points_to_float_payload(state["candidate_points"])
+        state["final_decision"] = "judge_accept_keep_molmo2"
+        debug_meta["final_decision"] = state["final_decision"]
+        debug_meta["final_response"] = state["final_points"]
+    return _save_stage_cache(state, "gemini_judge")
+
+
+def run_molmo2_gemini_fallback_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("pipeline_error") or not state["original_points_in_image"]:
+        return state
+    if not _begin_stage(state, "gemini_fallback"):
+        return state
+    if state.get("final_points") is not None:
+        return state
+
+    state["fallback_prompt"] = _build_fallback_grounding_prompt(
+        state["raw_user_input"],
+        state["enhanced_user_input"],
+        state["question_field"],
     )
-    debug_meta["gemini_fallback_accept"] = fallback_strict_accept
+    try:
+        state["fallback_raw"] = _call_gemini(
+            state["api_key"],
+            state["base_url"],
+            state["planner_model_name"],
+            state["fallback_prompt"],
+            [state["image_path"]],
+        )
+    except Exception as error:
+        traceback_text = traceback.format_exc()
+        if _is_network_error(error):
+            logger.exception(f"Gemini fallback grounding network error for image={state['image_filename']}")
+            return _mark_pipeline_error(
+                state,
+                "fallback_network_error",
+                "Gemini fallback grounding hit a network error.",
+                traceback_text,
+            )
+        logger.exception(f"Gemini fallback grounding failed for image={state['image_filename']}")
+        return _mark_pipeline_error(
+            state,
+            "fallback_error",
+            f"Gemini fallback grounding failed: {error}",
+            traceback_text,
+        )
 
-    if fallback_strict_accept:
-        final_points = _points_to_float_payload(fallback_points)
-        debug_meta["final_decision"] = "fallback_accept_use_gemini"
-        debug_meta["final_response"] = final_points
-        _save_debug_meta(debug_meta_path, debug_meta)
-        return final_points
+    fallback_parse_category = "counting" if _query_requests_multiple(state["raw_user_input"], state["enhanced_user_input"]) else ""
+    state["fallback_points"] = _extract_gemini_point_response(
+        state["fallback_raw"],
+        state["image_w"],
+        state["image_h"],
+        fallback_parse_category,
+    )
+    debug_meta = state["debug_meta"]
+    debug_meta["gemini_fallback_prompt"] = state["fallback_prompt"]
+    debug_meta["gemini_fallback_raw"] = state["fallback_raw"]
+    debug_meta["gemini_fallback_points"] = state["fallback_points"]
+    debug_meta["gemini_fallback_response_text"] = _normalize_final_text_no_markdown(state["fallback_points"])
 
-    final_points = _points_to_float_payload(candidate_points)
-    debug_meta["final_decision"] = "fallback_reject_keep_molmo2"
-    debug_meta["final_response"] = final_points
-    _save_debug_meta(debug_meta_path, debug_meta)
-    return final_points
+    if not state["fallback_points"]:
+        state["final_points"] = _points_to_float_payload(state["candidate_points"])
+        state["final_decision"] = "fallback_empty_keep_molmo2"
+        debug_meta["final_decision"] = state["final_decision"]
+        debug_meta["final_response"] = state["final_points"]
+        return _save_stage_cache(state, "gemini_fallback")
+
+    with Image.open(state["image_path"]) as source_image:
+        image = source_image.convert("RGB")
+    try:
+        state["fallback_viz_path"] = _save_points_visualization(
+            image,
+            state["fallback_points"],
+            state["original_points_in_image"],
+            state["category_dir"],
+            f"{state['image_stem']}_gemini_first_points_only.jpg",
+        )
+    finally:
+        image.close()
+    debug_meta["gemini_first_point_only_image_path"] = state["fallback_viz_path"]
+    return _save_stage_cache(state, "gemini_fallback")
+
+
+def run_molmo2_gemini_fallback_judge_stage(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("pipeline_error") or not state["fallback_points"]:
+        return state
+    if not _begin_stage(state, "fallback_judge"):
+        return state
+    if state.get("final_points") is not None:
+        return state
+
+    fallback_hard_reject_reason = _get_hard_reject_reason(state["fallback_points"], state["image_w"], state["image_h"])
+    if fallback_hard_reject_reason:
+        state["fallback_judge_raw"] = ""
+        state["fallback_judge_result"] = _make_rejected_judge_result(fallback_hard_reject_reason)
+    else:
+        try:
+            state["fallback_judge_raw"] = _call_gemini(
+                state["api_key"],
+                state["base_url"],
+                state["planner_model_name"],
+                state["judge_prompt"],
+                [state["fallback_viz_path"]],
+            )
+            state["fallback_judge_result"] = _parse_json_payload(state["fallback_judge_raw"])
+        except Exception as error:
+            traceback_text = traceback.format_exc()
+            if _is_network_error(error):
+                logger.exception(f"Gemini fallback judge network error for image={state['image_filename']}")
+                return _mark_pipeline_error(
+                    state,
+                    "fallback_judge_network_error",
+                    "Gemini fallback judge hit a network error.",
+                    traceback_text,
+                )
+            logger.exception(f"Gemini fallback judge failed for image={state['image_filename']}")
+            return _mark_pipeline_error(
+                state,
+                "fallback_judge_error",
+                f"Gemini fallback judge failed: {error}",
+                traceback_text,
+            )
+        if not isinstance(state["fallback_judge_result"], dict):
+            state["fallback_judge_result"] = None
+
+    state["fallback_strict_accept"] = _get_strict_judge_accept(state["fallback_judge_result"], fallback_hard_reject_reason)
+    debug_meta = state["debug_meta"]
+    debug_meta["gemini_fallback_final_judge_raw"] = state["fallback_judge_raw"]
+    debug_meta["gemini_fallback_final_judge_parsed"] = state["fallback_judge_result"]
+    debug_meta["gemini_fallback_final_judge_verification_trace"] = (
+        state["fallback_judge_result"].get("verification_trace", {}) if isinstance(state["fallback_judge_result"], dict) else {}
+    )
+    debug_meta["gemini_fallback_accept"] = state["fallback_strict_accept"]
+
+    if state["fallback_strict_accept"]:
+        state["final_points"] = _points_to_float_payload(state["fallback_points"])
+        state["final_decision"] = "fallback_accept_use_gemini"
+    else:
+        state["final_points"] = _points_to_float_payload(state["candidate_points"])
+        state["final_decision"] = "fallback_reject_keep_molmo2"
+    debug_meta["final_decision"] = state["final_decision"]
+    debug_meta["final_response"] = state["final_points"]
+    return _save_stage_cache(state, "fallback_judge")
+
+
+def finalize_molmo2_gemini_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("final_points") is None:
+        if state.get("candidate_points"):
+            state["final_points"] = _points_to_float_payload(state["candidate_points"])
+            state["final_decision"] = state.get("final_decision") or "pipeline_incomplete_keep_molmo2"
+        else:
+            state["final_points"] = []
+            state["final_decision"] = state.get("final_decision") or "pipeline_error_no_points"
+
+    debug_meta = state.get("debug_meta", {})
+    if isinstance(debug_meta, dict):
+        debug_meta["enhanced_user_input"] = state.get("enhanced_user_input", "")
+        debug_meta["final_decision"] = state.get("final_decision", "")
+        debug_meta["final_response"] = state.get("final_points", [])
+        if state.get("pipeline_error"):
+            debug_meta["pipeline_error"] = state["pipeline_error"]
+            debug_meta["pipeline_error_reason"] = debug_meta.get("pipeline_error_reason") or state["pipeline_error"]
+            debug_meta["pipeline_error_traceback"] = debug_meta.get("pipeline_error_traceback", "")
+    return _save_stage_cache(state, "finalize")
+
+
+def run_molmo2_gemini_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    state = run_molmo2_gemini_rewrite_stage(state)
+    state = run_molmo2_gemini_box_grounding_stage(state)
+    state = run_molmo2_gemini_local_stage(state)
+    state = run_molmo2_gemini_judge_stage(state)
+    state = run_molmo2_gemini_fallback_stage(state)
+    state = run_molmo2_gemini_fallback_judge_stage(state)
+    return finalize_molmo2_gemini_pipeline_state(state)
+
+
+def call_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge(
+    image_path: str,
+    object_name: str,
+    model_name: str = "allenai/Molmo2-4B",
+    category: Optional[str] = None,
+    item_ctx: Optional[Dict[str, Any]] = None,
+    runtime_options: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, List[float]]]:
+    """Rewrite first, then run the refpoint-hybrid Molmo2 route, and only judge reference-point samples."""
+    del object_name
+    state = build_molmo2_gemini_pipeline_state(
+        image_path=image_path,
+        model_name=model_name,
+        category=category,
+        item_ctx=item_ctx,
+        runtime_options=runtime_options,
+    )
+    state = run_molmo2_gemini_pipeline_state(state)
+    return state.get("final_points") or []
 
 
 """
-示例运行命令
+Example command
 
-当前对外只保留一条 Molmo2 + Gemini 融合 pipeline：
+Only one Molmo2 + Gemini hybrid pipeline is exposed at the moment:
 
 - `molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge`
-  - 流程：`raw user_input -> transform_gemini 改写 -> Gemini box/center grounding -> refpoint-hybrid local Molmo2 -> 仅参考点样本走 Gemini judge/fallback`
+  - Flow: `raw user_input -> transform_gemini rewrite -> Gemini box/center grounding -> refpoint-hybrid local Molmo2 -> Gemini judge/fallback only for reference-point samples`
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python model_evaluator.py \
@@ -1761,102 +2383,103 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python model_evaluator.py \
   --end -1
 ```
 
-参数说明与可选值
+Argument descriptions and supported values
 
 - `--type`
-  - 作用：选择 pipeline 类型。
-  - 当前支持值：`molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge`
-  - 含义：改写后先用 Gemini 生成 box/center helper，再走 refpoint-hybrid 本地 Molmo2 路由，只对 reference-point 样本继续 judge/fallback。
+  - Purpose: Selects the pipeline type.
+  - Currently supported value: `molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge`
+  - Meaning: After query rewriting, Gemini first produces the box/center helper, then the pipeline routes to the local refpoint-hybrid Molmo2 path, and only reference-point samples continue to the Gemini judge/fallback stage.
 
 - `--model`
-  - 作用：主模型名。
-  - 支持值：
-    - `1-1`：映射到 `allenai/Molmo2-8B`
-    - `1-2`：映射到 `allenai/Molmo2-4B`
-    - 也可直接写完整 HuggingFace 名字，例如 `allenai/Molmo2-4B`
+  - Purpose: Main model name.
+  - Supported values:
+    - `1-1`: maps to `allenai/Molmo2-8B`
+    - `1-2`: maps to `allenai/Molmo2-4B`
+    - You can also pass the full HuggingFace model name directly, for example `allenai/Molmo2-4B`
 
 - `--model_root`
-  - 作用：Molmo2 本地权重根目录。
-  - 可选值：
-    - 空字符串：直接按 `--model` 作为 HuggingFace repo id 加载，首次运行时会由 `transformers` 自动下载并缓存
-    - 本地目录路径：例如 `/path/to/models`
-  - 当传目录时，代码会拼接成 `<model_root>/<model短名>`，例如 `Molmo2-4B`
+  - Purpose: Root directory for local Molmo2 weights.
+  - Optional values:
+    - Empty string: load `--model` directly as a HuggingFace repo id; on the first run `transformers` will download and cache it automatically
+    - Local directory path, for example `/path/to/models`
+  - When a directory is provided, the code resolves it as `<model_root>/<huggingface_repo_id>`, for example `<model_root>/allenai/Molmo2-4B`
+  - You can also pass the concrete model directory itself, for example `/path/to/models/allenai/Molmo2-4B`
 
 - `--query_field`
-  - 作用：把改写后的 query 回写到数据 JSON 的哪个字段。
-  - 常用值：
-    - `enhanced_query`：推荐，专门存增强后的 query
-    - `user_input`：不推荐，会覆盖原始 query
-  - 当前 pipeline 会固定先生成 `enhanced_query`，然后也镜像写入这个字段。
+  - Purpose: Chooses which field in the data JSON receives the rewritten query.
+  - Common values:
+    - `enhanced_query`: recommended; stores the enhanced query separately
+    - `user_input`: not recommended; overwrites the original query
+  - The current pipeline always generates `enhanced_query` first and mirrors the rewritten text into this field as well.
 
 - `--enhance_model`
-  - 作用：Gemini 模型名。
-  - 当前 pipeline 中同时用于：
-    - transform 改写
+  - Purpose: Gemini model name.
+  - In the current pipeline it is used for:
+    - transform rewriting
     - box/center helper grounding
     - judge
     - fallback grounding
-  - 常用值：
+  - Common values:
     - `gemini-3.1-pro-preview`
-    - 其他你 API 端实际支持的 Gemini 模型名
+    - Any other Gemini model name supported by your API endpoint
 
 - `--max_tokens`
-  - 作用：Molmo2 生成时的最大新 token 数。
-  - 常用值：
-    - `256`：默认推荐
-    - 也可以改成更小或更大整数，例如 `128`、`512`
+  - Purpose: Maximum number of new tokens generated by Molmo2.
+  - Common values:
+    - `256`: recommended default
+    - You can also use smaller or larger integers such as `128` or `512`
 
-- 并发说明
-  - 当前 pipeline 不需要单独传 `--workers`
-  - 它会按 `min(可见 GPU 数, 待处理样本数)` 自动决定并发进程数
+- Concurrency notes
+  - This pipeline does not require a separate `--workers` argument
+  - It automatically chooses the worker process count as `min(number of visible GPUs, number of pending samples)`
 
 - `--suffix`
-  - 作用：结果目录和 `res_*.json` 的后缀，避免覆盖实验结果。
-  - 可选值：任意字符串
-  - 例如：
+  - Purpose: Suffix for the result directory and `res_*.json`, used to avoid overwriting existing experiment outputs.
+  - Optional values: any string
+  - Examples:
     - `molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge_exp`
     - `molmo2_refpoint_hybrid_pb`
 
 - `--start`
-  - 作用：从数据集哪个下标开始跑。
-  - 支持值：任意非负整数
-  - 例如：`0`、`100`
+  - Purpose: Dataset index to start from.
+  - Supported values: any non-negative integer
+  - Examples: `0`, `100`
 
 - `--end`
-  - 作用：跑到哪个下标结束。
-  - 支持值：
-    - `-1`：一直跑到数据集末尾
-    - 任意正整数：例如 `200`
+  - Purpose: Dataset index to stop at.
+  - Supported values:
+    - `-1`: run until the end of the dataset
+    - Any positive integer, for example `200`
 
 - `--resume` / `--no-resume`
-  - 作用：是否从已有结果继续跑。
-  - 可选值：
-    - `--resume`：继续已有结果，默认行为
-    - `--no-resume`：忽略已有结果，从头开始
+  - Purpose: Controls whether the run continues from existing results.
+  - Optional values:
+    - `--resume`: continue from existing results; this is the default behavior
+    - `--no-resume`: ignore existing results and start from scratch
 
-环境变量说明
+Environment variables
 
 - `CUDA_VISIBLE_DEVICES`
-  - 作用：指定 Molmo2 使用哪张卡。
-  - 例如：
+  - Purpose: Selects which GPU Molmo2 should use.
+  - Examples:
     - `CUDA_VISIBLE_DEVICES=0`
     - `CUDA_VISIBLE_DEVICES=1`
 
 - `API_KEY`
-  - 作用：Gemini API key。
+  - Purpose: Gemini API key.
 
 - `API_BASE_URL`
-  - 作用：Gemini API base url。
-  - 官方接口可为空，第三方兼容接口填对应地址。
+  - Purpose: Gemini API base URL.
+  - This can be left empty for the official endpoint; for third-party compatible endpoints, set the corresponding URL.
 
 - `API_MODEL_NAME`
-  - 可选。
-  - 若未显式传 `--enhance_model`，可从这里补默认 Gemini 模型名。
+  - Optional.
+  - If `--enhance_model` is not passed explicitly, this can provide the default Gemini model name.
 
-说明
+Notes
 
-- `transform_gemini` 仍然保留为本文件里的内部函数 `call_transform_gemini(...)`。
-- 它内部固定使用原工程的 `legacy` rewrite prompt。
-- refpoint-hybrid 版本里，Gemini helper box grounding 现在由 PointBench 在样本内即时执行，不再依赖外部预跑的 `hosted_api_box_center` 目录。
-- 如果当前样本的 Gemini helper 没产出 box，local prompt 会自动退化成 dualquery prompt 分支，不会因为缺 box 直接报错。
+- `transform_gemini` is still kept in this file as the internal function `call_transform_gemini(...)`.
+- Internally it always uses the original project's `legacy` rewrite prompt.
+- In the refpoint-hybrid version, Gemini helper box grounding is now executed on demand inside PointBench for each sample instead of relying on an externally precomputed `hosted_api_box_center` directory.
+- If the Gemini helper does not produce a box for the current sample, the local prompt automatically falls back to the dualquery prompt branch instead of failing immediately because of the missing box.
 """

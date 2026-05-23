@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from dotenv import load_dotenv
 import io
+import traceback
 import unicodedata
 from tqdm import tqdm
 from runtime_warnings import suppress_known_runtime_warnings
@@ -19,7 +20,15 @@ from runtime_warnings import suppress_known_runtime_warnings
 suppress_known_runtime_warnings()
 
 from molmo2_gemini_pipeline import (
+    build_molmo2_gemini_pipeline_state,
+    finalize_molmo2_gemini_pipeline_state,
     call_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge as run_molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge,
+    run_molmo2_gemini_box_grounding_stage,
+    run_molmo2_gemini_fallback_judge_stage,
+    run_molmo2_gemini_fallback_stage,
+    run_molmo2_gemini_judge_stage,
+    run_molmo2_gemini_local_stage,
+    run_molmo2_gemini_rewrite_stage,
 )
 
 # Import the same model interfaces and helpers as the main app
@@ -140,7 +149,7 @@ def _prepare_run_output_paths(run_output_name):
         path.mkdir(exist_ok=True, parents=True)
     return output_paths
 
-def _log_startup_parameters(model_name, model_type, query_field, max_workers, result_suffix, enhance_model, model_root, max_tokens, start, end, auto_worker_by_gpu=False):
+def _log_startup_parameters(model_name, model_type, query_field, max_workers, result_suffix, enhance_model, model_root, max_tokens, start, end, resume=True, auto_worker_by_gpu=False):
     startup_config = {
         "model": model_name,
         "type": model_type,
@@ -151,6 +160,7 @@ def _log_startup_parameters(model_name, model_type, query_field, max_workers, re
         "max_tokens": max_tokens,
         "start": start,
         "end": end,
+        "resume": resume,
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "visible_cuda_devices": _get_visible_cuda_devices(),
     }
@@ -1791,6 +1801,7 @@ def _evaluate_single_item(task_args):
             },
         )
     except Exception as e:
+        logger.exception(f"Unhandled evaluation error for image={image_filename}, model={model_name}")
         report(f"Error processing {image_filename} with {model_name}: {e}")
         return build_item_result(
             False,
@@ -1836,6 +1847,272 @@ def _iter_evaluation_results(pending_items, model_name, max_workers, logs_dir, r
         futures = [executor.submit(_evaluate_single_item, item) for item in pending_items]
         for future in as_completed(futures):
             yield future.result()
+
+def _build_item_paths(item):
+    category = item.get("category", "")
+    if category:
+        image_path = unicodedata.normalize('NFC', os.path.join(IMAGES_DIR, category, item["image_filename"]))
+        mask_path = unicodedata.normalize('NFC', os.path.join(MASKS_DIR, category, item["mask_filename"]))
+    else:
+        image_path = unicodedata.normalize('NFC', os.path.join(IMAGES_DIR, item["image_filename"]))
+        mask_path = unicodedata.normalize('NFC', os.path.join(MASKS_DIR, item["mask_filename"]))
+    return image_path, mask_path
+
+def _get_api_stage_workers(pending_count):
+    if pending_count <= 0:
+        return 1
+    env_override = os.getenv("POINTBENCH_API_STAGE_WORKERS", "").strip()
+    if env_override.isdigit() and int(env_override) > 0:
+        return min(int(env_override), pending_count)
+    return min(20, pending_count)
+
+def _return_precomputed_points(image_path, object_name, model_name, category=None, item_ctx=None, runtime_options=None):
+    del image_path, object_name, model_name, category, runtime_options
+    item = item_ctx if item_ctx is not None else {}
+    failure_reason = str(item.get("_precomputed_failure_reason") or "").strip()
+    if failure_reason:
+        raise RuntimeError(failure_reason)
+    return item.get("_precomputed_points", [])
+
+def _mark_stage_executor_error(state, stage_name, error):
+    error_code = f"{stage_name.lower().replace(' ', '_')}_executor_error"
+    state["pipeline_error"] = error_code
+    debug_meta = state.get("debug_meta")
+    if isinstance(debug_meta, dict):
+        debug_meta["pipeline_error"] = error_code
+        debug_meta["pipeline_error_reason"] = str(error)
+        debug_meta["pipeline_error_traceback"] = traceback.format_exc()
+    return state
+
+def _run_state_stage_in_threads(stage_name, states, stage_func, max_workers):
+    state_by_id = {state["state_id"]: state for state in states}
+    with tqdm(total=len(states), desc=stage_name, dynamic_ncols=True) as progress_bar:
+        if not states:
+            return states
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(stage_func, state): state["state_id"] for state in states}
+            for future in as_completed(futures):
+                state_id = futures[future]
+                try:
+                    state_by_id[state_id] = future.result()
+                except Exception as error:
+                    failed_state = state_by_id[state_id]
+                    logger.exception(
+                        f"{stage_name} executor error for state_id={state_id}, "
+                        f"image={failed_state.get('image_filename', '')}, category={failed_state.get('category', '')}"
+                    )
+                    state_by_id[state_id] = _mark_stage_executor_error(state_by_id[state_id], stage_name, error)
+                progress_bar.update(1)
+    return [state_by_id[state["state_id"]] for state in states]
+
+def _run_state_stage_in_process_pool(stage_name, states, stage_func, gpu_ids, logs_dir):
+    max_workers = min(len(gpu_ids), len(states))
+    if states and max_workers <= 1:
+        return _run_state_stage_in_threads(stage_name, states, stage_func, 1)
+
+    with tqdm(total=len(states), desc=stage_name, dynamic_ncols=True) as progress_bar:
+        if not states:
+            return states
+
+        state_by_id = {state["state_id"]: state for state in states}
+        mp_context = mp.get_context("spawn")
+        gpu_queue = mp_context.Queue()
+        for gpu_id in gpu_ids[:max_workers]:
+            gpu_queue.put(gpu_id)
+
+        original_silent_flag = os.environ.get("POINTBENCH_SILENT_STDERR_IMPORT")
+        os.environ["POINTBENCH_SILENT_STDERR_IMPORT"] = "1"
+        try:
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_context,
+                initializer=_init_pipeline_process_worker,
+                initargs=(gpu_queue, str(logs_dir), {}),
+            ) as executor:
+                futures = {executor.submit(stage_func, state): state["state_id"] for state in states}
+                for future in as_completed(futures):
+                    state_id = futures[future]
+                    try:
+                        state_by_id[state_id] = future.result()
+                    except Exception as error:
+                        failed_state = state_by_id[state_id]
+                        logger.exception(
+                            f"{stage_name} executor error for state_id={state_id}, "
+                            f"image={failed_state.get('image_filename', '')}, category={failed_state.get('category', '')}"
+                        )
+                        state_by_id[state_id] = _mark_stage_executor_error(state_by_id[state_id], stage_name, error)
+                    progress_bar.update(1)
+        finally:
+            if original_silent_flag is None:
+                os.environ.pop("POINTBENCH_SILENT_STDERR_IMPORT", None)
+            else:
+                os.environ["POINTBENCH_SILENT_STDERR_IMPORT"] = original_silent_flag
+
+    return [state_by_id[state["state_id"]] for state in states]
+
+def _run_molmo2_pipeline_stagewise(pending_items, runtime_options, logs_dir, gpu_ids):
+    staged_states = []
+    scoring_items = []
+
+    for task_args in pending_items:
+        display_index, source_index, item, data_size, model_name, model_type, _model_func, query_field, point_on_mask_dir = task_args
+        image_path, _mask_path = _build_item_paths(item)
+        try:
+            state = build_molmo2_gemini_pipeline_state(
+                image_path=image_path,
+                model_name=model_name,
+                category=item.get("category", ""),
+                item_ctx=item,
+                runtime_options=runtime_options,
+            )
+            state["state_id"] = source_index
+            state["display_index"] = display_index
+            state["source_index"] = source_index
+            state["data_size"] = data_size
+            state["model_name"] = model_name
+            state["model_type"] = model_type
+            state["query_field"] = query_field
+            state["point_on_mask_dir"] = point_on_mask_dir
+            staged_states.append(state)
+        except Exception as error:
+            logger.exception(
+                f"Failed to build fused pipeline state for image={item.get('image_filename', '')}, "
+                f"category={item.get('category', '')}"
+            )
+            item["_precomputed_points"] = []
+            item["_precomputed_failure_reason"] = f"Failed to build pipeline state: {error}"
+            scoring_items.append((
+                display_index,
+                source_index,
+                item,
+                data_size,
+                model_name,
+                model_type,
+                _return_precomputed_points,
+                query_field,
+                point_on_mask_dir,
+            ))
+
+    if staged_states:
+        resumed_state_count = sum(
+            any(bool(flag) for flag in state.get("debug_meta", {}).get("completed_stages", {}).values())
+            for state in staged_states
+        )
+        resumed_finished_count = sum(
+            bool(state.get("debug_meta", {}).get("completed_stages", {}).get("finalize"))
+            for state in staged_states
+        )
+        api_stage_workers = _get_api_stage_workers(len(staged_states))
+        logger.info(
+            "Stage-wise fused pipeline execution enabled: "
+            f"api_stage_workers={api_stage_workers}, visible_gpus={gpu_ids or []}, "
+            f"local_stage_workers={min(len(gpu_ids), len(staged_states)) if gpu_ids else 1}"
+        )
+        if resumed_state_count:
+            logger.info(
+                "Restored per-sample stage cache for "
+                f"{resumed_state_count}/{len(staged_states)} pending items; "
+                f"{resumed_finished_count} items were already finalized in cache."
+            )
+
+        staged_states = _run_state_stage_in_threads(
+            "Stage 1/6 Rewrite",
+            staged_states,
+            run_molmo2_gemini_rewrite_stage,
+            api_stage_workers,
+        )
+        staged_states = _run_state_stage_in_threads(
+            "Stage 2/6 Gemini Box",
+            [state for state in staged_states if not state.get("pipeline_error")],
+            run_molmo2_gemini_box_grounding_stage,
+            api_stage_workers,
+        ) + [state for state in staged_states if state.get("pipeline_error")]
+        staged_states.sort(key=lambda state: state["state_id"])
+
+        local_ready_states = [state for state in staged_states if not state.get("pipeline_error")]
+        failed_before_local = [state for state in staged_states if state.get("pipeline_error")]
+        local_finished_states = _run_state_stage_in_process_pool(
+            "Stage 3/6 Molmo2 Local",
+            local_ready_states,
+            run_molmo2_gemini_local_stage,
+            gpu_ids or ["0"],
+            logs_dir,
+        )
+        staged_states = sorted(local_finished_states + failed_before_local, key=lambda state: state["state_id"])
+
+        judge_candidates = [
+            state for state in staged_states
+            if not state.get("pipeline_error") and state.get("final_points") is None and state.get("original_points_in_image")
+        ]
+        judged_states = _run_state_stage_in_threads(
+            "Stage 4/6 Gemini Judge",
+            judge_candidates,
+            run_molmo2_gemini_judge_stage,
+            api_stage_workers,
+        )
+        judged_by_id = {state["state_id"]: state for state in judged_states}
+        staged_states = [judged_by_id.get(state["state_id"], state) for state in staged_states]
+
+        fallback_candidates = [
+            state for state in staged_states
+            if not state.get("pipeline_error") and state.get("final_points") is None and state.get("original_points_in_image")
+        ]
+        fallback_states = _run_state_stage_in_threads(
+            "Stage 5/6 Gemini Fallback",
+            fallback_candidates,
+            run_molmo2_gemini_fallback_stage,
+            api_stage_workers,
+        )
+        fallback_by_id = {state["state_id"]: state for state in fallback_states}
+        staged_states = [fallback_by_id.get(state["state_id"], state) for state in staged_states]
+
+        fallback_judge_candidates = [
+            state for state in staged_states
+            if not state.get("pipeline_error") and state.get("final_points") is None and state.get("fallback_points")
+        ]
+        fallback_judged_states = _run_state_stage_in_threads(
+            "Stage 6/6 Fallback Judge",
+            fallback_judge_candidates,
+            run_molmo2_gemini_fallback_judge_stage,
+            api_stage_workers,
+        )
+        fallback_judged_by_id = {state["state_id"]: state for state in fallback_judged_states}
+        staged_states = [fallback_judged_by_id.get(state["state_id"], state) for state in staged_states]
+
+        for state in staged_states:
+            finalized_state = finalize_molmo2_gemini_pipeline_state(state)
+            finalized_state["item"]["_precomputed_points"] = finalized_state.get("final_points") or []
+            if not finalized_state["item"]["_precomputed_points"] and finalized_state.get("pipeline_error"):
+                finalized_state["item"]["_precomputed_failure_reason"] = (
+                    finalized_state.get("debug_meta", {}).get("pipeline_error_reason")
+                    or finalized_state["pipeline_error"]
+                )
+            scoring_items.append((
+                finalized_state["display_index"],
+                finalized_state["source_index"],
+                finalized_state["item"],
+                finalized_state["data_size"],
+                finalized_state["model_name"],
+                finalized_state["model_type"],
+                _return_precomputed_points,
+                finalized_state["query_field"],
+                finalized_state["point_on_mask_dir"],
+            ))
+
+    if not scoring_items:
+        return []
+
+    scoring_workers = min(8, len(scoring_items))
+    return list(
+        _iter_evaluation_results(
+            scoring_items,
+            "Molmo2 staged scoring",
+            scoring_workers,
+            logs_dir,
+            {},
+            use_process_pool=False,
+        )
+    )
 
 def _record_item_result(item_result, results, item_count, results_file, progress_callback, res_data=None, res_path=None):
     results["total"] += 1
@@ -1933,6 +2210,7 @@ def evaluate_model(
         max_tokens,
         start,
         end,
+        resume=resume,
         auto_worker_by_gpu=auto_worker_by_gpu,
     )
 
@@ -1959,6 +2237,7 @@ def evaluate_model(
             "image_points_map": IMAGE_POINTS_MAP,
             "model_root": model_root,
             "max_tokens": max_tokens,
+            "resume": resume,
             "visualizations_dir": str(output_paths["pipeline_visualizations_dir"]),
         }
     else:
@@ -2080,27 +2359,45 @@ def evaluate_model(
     if progress_callback:
         progress_callback(f"Evaluating {len(pending_items)} images with {max_workers} {worker_label}")
 
-    # workers 只返回单条样本结果，父进程统一聚合和写 JSON，避免多进程并发写同一个结果文件。
-    worker_results = _iter_evaluation_results(
-        pending_items,
-        model_name,
-        max_workers,
-        output_paths["logs_dir"],
-        runtime_options,
-        use_process_pool=use_process_pool,
-        gpu_ids=worker_gpus,
-    )
-    progress_desc = "Molmo2 Gemini judge" if model_type_lower in MOLMO2_PIPELINE_MODEL_TYPES else f"Evaluating {model_name}"
-    for item_result in tqdm(worker_results, total=len(pending_items), desc=progress_desc, dynamic_ncols=True):
-        item_count = _record_item_result(
-            item_result,
-            results,
-            item_count,
-            results_file,
-            progress_callback,
-            res_data=all_data,
-            res_path=res_path,
+    if model_type_lower in MOLMO2_PIPELINE_MODEL_TYPES:
+        worker_results = _run_molmo2_pipeline_stagewise(
+            pending_items,
+            runtime_options,
+            output_paths["logs_dir"],
+            worker_gpus,
         )
+        for item_result in worker_results:
+            item_count = _record_item_result(
+                item_result,
+                results,
+                item_count,
+                results_file,
+                progress_callback,
+                res_data=all_data,
+                res_path=res_path,
+            )
+    else:
+        # workers 只返回单条样本结果，父进程统一聚合和写 JSON，避免多进程并发写同一个结果文件。
+        worker_results = _iter_evaluation_results(
+            pending_items,
+            model_name,
+            max_workers,
+            output_paths["logs_dir"],
+            runtime_options,
+            use_process_pool=use_process_pool,
+            gpu_ids=worker_gpus,
+        )
+        progress_desc = f"Evaluating {model_name}"
+        for item_result in tqdm(worker_results, total=len(pending_items), desc=progress_desc, dynamic_ncols=True):
+            item_count = _record_item_result(
+                item_result,
+                results,
+                item_count,
+                results_file,
+                progress_callback,
+                res_data=all_data,
+                res_path=res_path,
+            )
         
     # Calculate final success rate
     if results["total"] > 0:
@@ -2151,7 +2448,7 @@ def _add_molmo2_gemini_cli_args(parser):
     molmo2_group.add_argument(
         "--model_root",
         default="",
-        help="Optional local weight root for Molmo2. Leave empty to load/download the HuggingFace repo given by --model; when set to a directory, the code expects <model_root>/<model_short_name>.",
+        help="Optional local weight root for Molmo2. Leave empty to load/download the HuggingFace repo given by --model; when set to a directory, the code expects <model_root>/<huggingface_repo_id>, for example <model_root>/allenai/Molmo2-4B.",
     )
     molmo2_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Gemini model used for rewrite, judge, and fallback grounding.")
     molmo2_group.add_argument("--max_tokens", type=int, default=256, help="Max new tokens for Molmo2 generation.")

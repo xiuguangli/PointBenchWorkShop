@@ -60,6 +60,18 @@ most one worker process per visible GPU, and the main process will aggregate the
 results with a single overall progress bar. You do not need to set a separate
 `--workers` value for this pipeline.
 
+The fused pipeline now runs stage-wise across the dataset:
+batch rewrite -> batch Gemini box helper -> batch local Molmo2 -> batch judge/fallback.
+
+Each stage prints its own named progress bar, so you can see whether the run is
+currently in rewrite, Gemini helper, local Molmo2, judge, or fallback.
+
+The fused pipeline also keeps a per-sample stage cache in the corresponding
+`visualizations/.../*_justify_meta.json` file. If the same command is rerun, the
+pipeline will resume from the last finished stage for each unfinished sample
+instead of repeating completed Gemini API stages. Use `--no-resume` if you want
+to ignore the cache and rerun from scratch.
+
 The current project-specific fused pipeline is:
 
 `raw user_input -> Gemini rewrite -> Gemini box/center helper -> refpoint-hybrid Molmo2 -> Gemini judge/fallback`
@@ -67,7 +79,8 @@ The current project-specific fused pipeline is:
 For Molmo2 weights:
 
 - If you leave `--model_root` empty, the code will load the HuggingFace repo named by `--model` and let `transformers` download/cache it automatically.
-- If you provide `--model_root`, the code expects the local weights at `<model_root>/<model_short_name>`, for example `<model_root>/Molmo2-4B`.
+- If you provide `--model_root`, the code expects the local weights at `<model_root>/<huggingface_repo_id>`, for example `<model_root>/allenai/Molmo2-4B`.
+- You can also pass the concrete model directory itself, for example `/path/to/models/allenai/Molmo2-4B`.
 
 The original base model branches such as `--type gemini` in `model_evaluator.py`
 are still kept. The removed experimental pipeline wrappers are no longer exposed.
