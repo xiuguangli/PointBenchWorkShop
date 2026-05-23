@@ -11,6 +11,7 @@ import re
 import socket
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
 from pathlib import Path
@@ -57,6 +58,8 @@ NON_PLURAL_ENDINGS = ("ss", "us", "is")
 
 _GEMINI_CLIENTS: Dict[Tuple[str, str], Any] = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
+_GEMINI_NETWORK_RETRIES = 3
+_GEMINI_REQUEST_TIMEOUT_MS = 100_000
 _MOLMO2_MODEL = None
 _MOLMO2_PROCESSOR = None
 _MOLMO2_MODEL_PATH = None
@@ -71,6 +74,8 @@ MOLMO2_MODEL_ALIASES = {
 GEMINI_BOX_PROMPT_VERSION = 2
 INTERNAL_HOSTED_GEMINI_BOX_SOURCE_NAME = "internal_hosted_api_box_center"
 STAGE_CACHE_VERSION = 1
+REWRITE_PROMPT_MODE = "legacy_reference_overlay"
+REWRITE_SOURCE_PIPELINE_NAME = "transform_gemini_twolines"
 PIPELINE_STAGE_ORDER = (
     "rewrite",
     "gemini_box",
@@ -79,6 +84,16 @@ PIPELINE_STAGE_ORDER = (
     "gemini_fallback",
     "fallback_judge",
     "finalize",
+)
+_REFERENCE_MARKER_RADIUS_RATIO = 0.06
+_REFERENCE_MARKER_MIN_RADIUS = 12
+_GRID_LINE_WIDTH_RATIO = 0.002
+_GRID_LINE_MIN_WIDTH = 1
+_GRID_SPACING_RATIO = 0.12
+_GRID_MIN_SPACING = 36
+_DISTANCE_QUERY_PATTERN = re.compile(
+    r"\b(?:closest|nearest|farthest|furthest|closer|farther|further|near)\b|\bnext to\b|\badjacent\b",
+    re.IGNORECASE,
 )
 
 
@@ -168,8 +183,11 @@ def _get_gemini_client(api_key: str, base_url: str):
             return cached_client
 
         client_kwargs = {"api_key": api_key}
+        http_options_kwargs = {"timeout": _GEMINI_REQUEST_TIMEOUT_MS}
         if base_url:
-            client_kwargs["http_options"] = types.HttpOptions(base_url=base_url)
+            http_options_kwargs["base_url"] = base_url
+        # google-genai uses milliseconds here; 100_000 means a 100-second request timeout.
+        client_kwargs["http_options"] = types.HttpOptions(**http_options_kwargs)
         client = genai.Client(**client_kwargs)
         _GEMINI_CLIENTS[cache_key] = client
         return client
@@ -198,8 +216,20 @@ def _call_gemini(api_key: str, base_url: str, model_name: str, prompt_text: str,
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
 
     client = _get_gemini_client(api_key, base_url)
-    response = client.models.generate_content(model=model_name, contents=contents)
-    return (response.text or "").strip()
+    for attempt in range(_GEMINI_NETWORK_RETRIES + 1):
+        try:
+            response = client.models.generate_content(model=model_name, contents=contents)
+            return (response.text or "").strip()
+        except Exception as error:
+            if attempt >= _GEMINI_NETWORK_RETRIES or not _is_network_error(error):
+                raise
+            # Gemini API occasionally closes HTTP streams mid-flight; retry only transient network failures.
+            logger.warning(
+                f"Gemini network error, retry {attempt + 1}/{_GEMINI_NETWORK_RETRIES}: "
+                f"{type(error).__name__}: {error}"
+            )
+            time.sleep(2 ** attempt)
+    return ""
 
 
 def _legacy_steerable_extra(category: str) -> str:
@@ -216,7 +246,7 @@ Steerable-specific rule:
 """.strip()
 
 
-def _build_rewrite_prompt(raw_input: str, category: str, original_points_info: str) -> Tuple[str, str]:
+def _build_legacy_rewrite_prompt(raw_input: str, category: str, original_points_info: str) -> Tuple[str, str]:
     """Use the exact legacy rewrite prompt from the original evaluate project."""
     system_prompt = f"""
 You are an expert instruction rewriter for visual grounding and point-based segmentation models such as SAM-style models and GroundingDINO.
@@ -293,8 +323,44 @@ Return only the rewritten instruction.
     return system_prompt, user_prompt
 
 
+def _build_legacy_reference_overlay_prompt(raw_input: str, category: str, original_points_info: str) -> Tuple[str, str]:
+    """Match transform_gemini_twolines legacy_reference_overlay prompt behavior."""
+    system_prompt, user_prompt = _build_legacy_rewrite_prompt(raw_input, category, original_points_info)
+    overlay_guidance = """
+Reference-overlay rules:
+- Some images may contain one large red reference point.
+- For distance-oriented or adjacency-oriented queries, the image may also include a faint grid centered on that same reference point, and the grid's center row and center column indicate the anchor alignment.
+- Treat the red point and faint grid only as visual aids for resolving the final target.
+- Use these aids to compare direction and relative distance for relations such as nearest, closest, farthest, closer, near, next to, and adjacent.
+- Do not rewrite the target as the grid or reference point unless the raw instruction literally asks for them.
+- If the visual aids make one final object or region unambiguous, rewrite directly to that final target.
+""".strip()
+    return f"{system_prompt}\n\n{overlay_guidance}", user_prompt
+
+
+def _build_rewrite_prompt(
+    raw_input: str,
+    category: str,
+    original_points_info: str,
+    prompt_mode: str = REWRITE_PROMPT_MODE,
+) -> Tuple[str, str]:
+    if prompt_mode == "legacy":
+        return _build_legacy_rewrite_prompt(raw_input, category, original_points_info)
+    if prompt_mode == "legacy_reference_overlay":
+        return _build_legacy_reference_overlay_prompt(raw_input, category, original_points_info)
+    raise ValueError(f"Unknown rewrite prompt mode: {prompt_mode}")
+
+
+def _has_reference_info(item: Dict[str, Any]) -> bool:
+    return bool(str(item.get("original_points_info", "")).strip())
+
+
+def _is_distance_query(query_text: str) -> bool:
+    return bool(_DISTANCE_QUERY_PATTERN.search(query_text or ""))
+
+
 def _reference_marker_radius(image_w: int, image_h: int) -> int:
-    return max(12, int(round(min(image_w, image_h) * 0.06)))
+    return max(_REFERENCE_MARKER_MIN_RADIUS, int(round(min(image_w, image_h) * _REFERENCE_MARKER_RADIUS_RATIO)))
 
 
 def _draw_reference_marker(draw: ImageDraw.ImageDraw, point: Tuple[float, float], radius: int) -> None:
@@ -304,31 +370,157 @@ def _draw_reference_marker(draw: ImageDraw.ImageDraw, point: Tuple[float, float]
     draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=(255, 0, 0))
 
 
-def _build_reference_marker_image(image_path: str, original_points_in_image: List[List[float]]) -> Optional[Image.Image]:
+def _clamp_point(point: Tuple[float, float], width: int, height: int) -> Tuple[int, int]:
+    return (
+        int(round(min(max(float(point[0]), 0.0), max(width - 1, 0)))),
+        int(round(min(max(float(point[1]), 0.0), max(height - 1, 0)))),
+    )
+
+
+def _draw_reference_grid(
+    draw: ImageDraw.ImageDraw,
+    point: Tuple[int, int],
+    width: int,
+    height: int,
+) -> None:
+    cx, cy = point
+    spacing = max(_GRID_MIN_SPACING, int(round(min(width, height) * _GRID_SPACING_RATIO)))
+    grid_width = max(_GRID_LINE_MIN_WIDTH, int(round(min(width, height) * _GRID_LINE_WIDTH_RATIO)))
+    center_line_width = max(grid_width + 1, 2)
+
+    # The centered guide lines act as the anchor alignment cue.
+    draw.line([(0, cy), (width - 1, cy)], fill=(255, 120, 120, 140), width=center_line_width)
+    draw.line([(cx, 0), (cx, height - 1)], fill=(255, 120, 120, 140), width=center_line_width)
+
+    # Expand the grid symmetrically from the reference point to visualize relative distance.
+    for offset in range(spacing, max(width, height) + spacing, spacing):
+        left_x = cx - offset
+        right_x = cx + offset
+        top_y = cy - offset
+        bottom_y = cy + offset
+        if left_x >= 0:
+            draw.line([(left_x, 0), (left_x, height - 1)], fill=(255, 210, 210, 95), width=grid_width)
+        if right_x < width:
+            draw.line([(right_x, 0), (right_x, height - 1)], fill=(255, 210, 210, 95), width=grid_width)
+        if top_y >= 0:
+            draw.line([(0, top_y), (width - 1, top_y)], fill=(255, 210, 210, 95), width=grid_width)
+        if bottom_y < height:
+            draw.line([(0, bottom_y), (width - 1, bottom_y)], fill=(255, 210, 210, 95), width=grid_width)
+
+
+def _build_rewrite_overlay_meta(
+    image_path: str,
+    original_points_in_image: List[List[float]],
+    query_text: str,
+) -> Dict[str, Any]:
+    with Image.open(image_path) as source_image:
+        width, height = source_image.size
+    clamped_points = [_clamp_point((point_x, point_y), width, height) for point_x, point_y in original_points_in_image]
+    return {
+        "reference_points_count": len(clamped_points),
+        "reference_points_in_image": clamped_points,
+        "distance_query": _is_distance_query(query_text),
+        "crosshair_enabled": len(clamped_points) == 1 and not _is_distance_query(query_text),
+        "grid_enabled": len(clamped_points) == 1 and _is_distance_query(query_text),
+        "image_size": {"width": width, "height": height},
+    }
+
+
+def _build_rewrite_overlay_output_paths(visualizations_dir: str, item: Dict[str, Any]) -> Tuple[str, str, str]:
+    category = item.get("category", "unknown") or "unknown"
+    image_name = unicodedata.normalize("NFC", item.get("image_filename") or os.path.basename(item["image_path"]))
+    image_stem, _ = os.path.splitext(image_name)
+    save_dir = unicodedata.normalize("NFC", os.path.join(visualizations_dir, "rewrite_overlay", category))
+    overlay_path = unicodedata.normalize("NFC", os.path.join(save_dir, f"{image_stem}_reference_overlay.png"))
+    meta_path = unicodedata.normalize("NFC", os.path.join(save_dir, f"{image_stem}_reference_overlay.json"))
+    return save_dir, overlay_path, meta_path
+
+
+def _save_rewrite_overlay_artifacts(
+    visualizations_dir: str,
+    item: Dict[str, Any],
+    reference_image: Image.Image,
+    overlay_meta: Dict[str, Any],
+    prompt_mode: str,
+    model_name: str,
+) -> Tuple[str, str]:
+    save_dir, overlay_path, meta_path = _build_rewrite_overlay_output_paths(visualizations_dir, item)
+    os.makedirs(save_dir, exist_ok=True)
+    reference_image.save(overlay_path, format="PNG")
+    with open(meta_path, "w", encoding="utf-8") as meta_file:
+        json.dump(
+            {
+                "pipeline": item.get("pipeline_name", "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge"),
+                "rewrite_source_pipeline": REWRITE_SOURCE_PIPELINE_NAME,
+                "rewrite_prompt_mode": prompt_mode,
+                "planner_model_name": model_name,
+                "image_filename": item.get("image_filename"),
+                "image_path": item.get("image_path"),
+                "category": item.get("category", ""),
+                "raw_user_input": item.get("user_input", ""),
+                "original_points_info": item.get("original_points_info", ""),
+                **overlay_meta,
+                "overlay_image_path": overlay_path,
+            },
+            meta_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return overlay_path, meta_path
+
+
+def _build_reference_marker_image(
+    image_path: str,
+    original_points_in_image: List[List[float]],
+    query_text: str,
+) -> Optional[Image.Image]:
     if not original_points_in_image:
         return None
     with Image.open(image_path) as source_image:
-        image = source_image.convert("RGB")
+        image = source_image.convert("RGBA")
     image_w, image_h = image.size
     radius = _reference_marker_radius(image_w, image_h)
-    draw = ImageDraw.Draw(image)
-    for point_x, point_y in original_points_in_image:
-        clamped_point = (
-            min(max(float(point_x), 0.0), max(image_w - 1, 0)),
-            min(max(float(point_y), 0.0), max(image_h - 1, 0)),
-        )
-        _draw_reference_marker(draw, clamped_point, radius)
-    return image
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    clamped_points = [_clamp_point((point_x, point_y), image_w, image_h) for point_x, point_y in original_points_in_image]
+
+    # Only add the distance grid for single-anchor queries to avoid clutter.
+    if len(clamped_points) == 1 and _is_distance_query(query_text):
+        _draw_reference_grid(draw, clamped_points[0], image_w, image_h)
+
+    for point in clamped_points:
+        _draw_reference_marker(draw, point, radius)
+    return Image.alpha_composite(image, overlay).convert("RGB")
 
 
-def _build_reference_marker_image_path(image_path: str, original_points_in_image: List[List[float]]) -> Optional[str]:
-    reference_image = _build_reference_marker_image(image_path, original_points_in_image)
+def _build_reference_marker_image_path(
+    image_path: str,
+    original_points_in_image: List[List[float]],
+    query_text: str,
+    visualizations_dir: str = "",
+    item: Optional[Dict[str, Any]] = None,
+    prompt_mode: str = REWRITE_PROMPT_MODE,
+    model_name: str = "",
+) -> Optional[str]:
+    reference_image = _build_reference_marker_image(image_path, original_points_in_image, query_text)
     if reference_image is None:
         return None
-    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    if visualizations_dir and item is not None:
+        overlay_meta = _build_rewrite_overlay_meta(image_path, original_points_in_image, query_text)
+        overlay_path, meta_path = _save_rewrite_overlay_artifacts(
+            visualizations_dir,
+            item,
+            reference_image,
+            overlay_meta,
+            prompt_mode,
+            model_name,
+        )
+        item["rewrite_overlay_path"] = overlay_path
+        item["rewrite_overlay_meta_path"] = meta_path
+    temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     temp_path = temp_file.name
     temp_file.close()
-    reference_image.save(temp_path, format="JPEG")
+    reference_image.save(temp_path, format="PNG")
     return temp_path
 
 
@@ -340,32 +532,46 @@ def call_transform_gemini(
     item_ctx: Optional[Dict[str, Any]] = None,
     runtime_options: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """PointBench-native version of transform_gemini."""
+    """PointBench-native rewrite aligned with transform_gemini_twolines."""
     del object_name
     options = runtime_options or {}
     item = item_ctx if item_ctx is not None else {}
     item["image_path"] = image_path
     item["category"] = category or item.get("category", "")
     item["user_input"] = str(item.get("user_input") or "").strip()
+    item["pipeline_name"] = "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge"
 
     image_points_map = options.get("image_points_map", {})
     original_points_info, original_points_in_image = _get_original_points_context(image_path, image_points_map)
     item["original_points_info"] = original_points_info
     item["original_points_in_image"] = original_points_in_image
+    item["rewrite_overlay_path"] = ""
+    item["rewrite_overlay_meta_path"] = ""
 
     api_key = str(options.get("api_key") or os.getenv("API_KEY", "")).strip()
     base_url = str(options.get("base_url") or os.getenv("API_BASE_URL", "")).strip()
     resolved_model_name = str(model_name or options.get("enhance_model") or os.getenv("API_MODEL_NAME") or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.1-pro-preview")).strip()
+    prompt_mode = str(options.get("rewrite_prompt_mode") or REWRITE_PROMPT_MODE).strip() or REWRITE_PROMPT_MODE
+    visualizations_dir = str(options.get("visualizations_dir") or "").strip()
 
     temp_reference_path: Optional[str] = None
     try:
-        if str(item.get("original_points_info", "")).strip():
-            temp_reference_path = _build_reference_marker_image_path(image_path, item.get("original_points_in_image", []) or [])
+        if _has_reference_info(item):
+            temp_reference_path = _build_reference_marker_image_path(
+                image_path,
+                item.get("original_points_in_image", []) or [],
+                item["user_input"],
+                visualizations_dir=visualizations_dir,
+                item=item,
+                prompt_mode=prompt_mode,
+                model_name=resolved_model_name,
+            )
         resolved_image_path = temp_reference_path or image_path
         system_prompt, user_prompt = _build_rewrite_prompt(
             item["user_input"],
             item.get("category", ""),
             item.get("original_points_info", ""),
+            prompt_mode=prompt_mode,
         )
         combined_prompt = f"{system_prompt}\n\n{user_prompt}".strip()
         content = _call_gemini(api_key, base_url, resolved_model_name, combined_prompt, [resolved_image_path])
@@ -627,13 +833,20 @@ def _path_exists(path_value: str) -> bool:
     return bool(path_value) and os.path.exists(path_value)
 
 
+def _normalize_model_root_for_signature(model_root: str) -> str:
+    model_root_text = str(model_root or "").strip()
+    if not model_root_text:
+        return ""
+    return str(Path(model_root_text).expanduser())
+
+
 def _build_stage_cache_signature(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "pipeline": "molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge",
         "question_field": state["question_field"],
         "planner_model_name": state["planner_model_name"],
         "resolved_model_name": state["resolved_model_name"],
-        "model_root": state["model_root"],
+        "model_root": _normalize_model_root_for_signature(state["model_root"]),
         "max_tokens": state["max_tokens"],
     }
 
@@ -645,6 +858,25 @@ def _get_completed_stages(debug_meta: Dict[str, Any]) -> Dict[str, bool]:
         for stage_name in PIPELINE_STAGE_ORDER:
             completed_stages[stage_name] = bool(cached_stages.get(stage_name))
     return completed_stages
+
+
+def _stage_cache_signature_matches(state: Dict[str, Any], cached_meta: Dict[str, Any]) -> bool:
+    cached_signature = cached_meta.get("stage_cache_signature")
+    current_signature = _build_stage_cache_signature(state)
+    if cached_signature == current_signature:
+        return True
+
+    completed_stages = _get_completed_stages(cached_meta)
+    rewrite_only = completed_stages["rewrite"] and not any(
+        completed_stages[stage_name] for stage_name in PIPELINE_STAGE_ORDER if stage_name != "rewrite"
+    )
+    if not rewrite_only or not isinstance(cached_signature, dict):
+        return False
+
+    return (
+        cached_signature.get("pipeline") == current_signature["pipeline"]
+        and cached_signature.get("question_field") == current_signature["question_field"]
+    )
 
 
 def _rebuild_helper_guidance(debug_meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -676,7 +908,7 @@ def _restore_stage_cache(state: Dict[str, Any]) -> Dict[str, Any]:
         return state
     if cached_meta.get("stage_cache_version") != STAGE_CACHE_VERSION:
         return state
-    if cached_meta.get("stage_cache_signature") != _build_stage_cache_signature(state):
+    if not _stage_cache_signature_matches(state, cached_meta):
         return state
 
     state["debug_meta"].update(cached_meta)
@@ -1736,6 +1968,10 @@ def _build_initial_debug_meta(state: Dict[str, Any]) -> Dict[str, Any]:
         "category": state["category"],
         "question_field": state["question_field"],
         "raw_user_input": state["raw_user_input"],
+        "rewrite_source_pipeline": REWRITE_SOURCE_PIPELINE_NAME,
+        "rewrite_prompt_mode": REWRITE_PROMPT_MODE,
+        "rewrite_overlay_image_path": "",
+        "rewrite_overlay_meta_path": "",
         "enhanced_user_input": "",
         "local_route": "",
         "local_prompt_source_pipeline": "molmo2_guidance_dualquery_refpoint_hybrid",
@@ -1830,7 +2066,7 @@ def build_molmo2_gemini_pipeline_state(
 
     question_field = str(options.get("query_field", "enhanced_query")).strip() or "enhanced_query"
     image_name = unicodedata.normalize("NFC", item["image_filename"])
-    image_stem = os.path.splitext(image_name)[0]
+    image_stem = image_name.replace("/", "_").replace("\\", "_")
     visualizations_dir = str(
         options.get("visualizations_dir", "visualizations/molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge")
     ).strip() or "visualizations/molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge"
@@ -1923,6 +2159,8 @@ def run_molmo2_gemini_rewrite_stage(state: Dict[str, Any]) -> Dict[str, Any]:
                 "api_key": state["api_key"],
                 "base_url": state["base_url"],
                 "enhance_model": state["planner_model_name"],
+                "visualizations_dir": state["runtime_options"].get("visualizations_dir", ""),
+                "rewrite_prompt_mode": REWRITE_PROMPT_MODE,
             },
         ).strip()
     except Exception:
@@ -1943,6 +2181,10 @@ def run_molmo2_gemini_rewrite_stage(state: Dict[str, Any]) -> Dict[str, Any]:
     state["item"]["enhanced_query"] = enhanced_user_input
     state["item"][state["question_field"]] = enhanced_user_input
     state["debug_meta"]["enhanced_user_input"] = enhanced_user_input
+    state["debug_meta"]["rewrite_source_pipeline"] = REWRITE_SOURCE_PIPELINE_NAME
+    state["debug_meta"]["rewrite_prompt_mode"] = REWRITE_PROMPT_MODE
+    state["debug_meta"]["rewrite_overlay_image_path"] = str(state["item"].get("rewrite_overlay_path") or "")
+    state["debug_meta"]["rewrite_overlay_meta_path"] = str(state["item"].get("rewrite_overlay_meta_path") or "")
     return _save_stage_cache(state, "rewrite")
 
 
@@ -2479,7 +2721,7 @@ Environment variables
 Notes
 
 - `transform_gemini` is still kept in this file as the internal function `call_transform_gemini(...)`.
-- Internally it always uses the original project's `legacy` rewrite prompt.
+- Internally the rewrite stage now follows `transform_gemini_twolines` with the original project's `legacy_reference_overlay` prompt plus the reference-point overlay/grid visualization rules.
 - In the refpoint-hybrid version, Gemini helper box grounding is now executed on demand inside PointBench for each sample instead of relying on an externally precomputed `hosted_api_box_center` directory.
 - If the Gemini helper does not produce a box for the current sample, the local prompt automatically falls back to the dualquery prompt branch instead of failing immediately because of the missing box.
 """

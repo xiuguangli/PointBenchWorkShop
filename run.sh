@@ -77,7 +77,7 @@ CMD=(
   --max_tokens 256
   --start 0
   --end -1
-  --suffix exp
+  --suffix exp_2
 )
 
 if [[ -n "$MODEL_ROOT" ]]; then

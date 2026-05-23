@@ -74,7 +74,7 @@ to ignore the cache and rerun from scratch.
 
 The current project-specific fused pipeline is:
 
-`raw user_input -> Gemini rewrite -> Gemini box/center helper -> refpoint-hybrid Molmo2 -> Gemini judge/fallback`
+`raw user_input -> transform_gemini_twolines-style Gemini rewrite -> Gemini box/center helper -> refpoint-hybrid Molmo2 -> Gemini judge/fallback`
 
 For Molmo2 weights:
 

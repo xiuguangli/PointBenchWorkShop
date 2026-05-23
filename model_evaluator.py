@@ -2166,6 +2166,22 @@ def _record_item_result(item_result, results, item_count, results_file, progress
         progress_callback(f"Intermediate results saved to {results_file}")
     return item_count
 
+def _dedupe_results_by_image(results):
+    deduped_details = {}
+    for detail in results.get("details", []):
+        image_name = detail.get("image")
+        if image_name:
+            deduped_details[image_name] = detail
+
+    details = list(deduped_details.values())
+    success_count = sum(1 for detail in details if detail.get("success"))
+    return {
+        "total": len(details),
+        "success": success_count,
+        "failure": len(details) - success_count,
+        "details": details,
+    }
+
 def evaluate_model(
     model_name,
     model_type,
@@ -2276,6 +2292,14 @@ def evaluate_model(
         try:
             with open(results_file, "r") as f:
                 results = json.load(f)
+            original_total = len(results.get("details", []))
+            results = _dedupe_results_by_image(results)
+            if results["total"] != original_total:
+                logger.info(
+                    f"Deduplicated existing results by image: {original_total} rows -> {results['total']} unique images"
+                )
+                with open(results_file, "w") as f:
+                    json.dump(results, f, indent=2)
             logger.info(f"Resuming from existing results file with {results['success']} successes and {results['failure']} failures")
             if progress_callback:
                 progress_callback(f"Resuming from existing results file with {results['success']} successes and {results['failure']} failures")
