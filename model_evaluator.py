@@ -2102,6 +2102,13 @@ def _run_molmo2_pipeline_stagewise(pending_items, runtime_options, logs_dir, gpu
     if not scoring_items:
         return []
 
+    deduped_scoring_items = _dedupe_scoring_items(scoring_items)
+    if len(deduped_scoring_items) != len(scoring_items):
+        logger.warning(
+            "Deduplicated staged scoring tasks by source index: "
+            f"{len(scoring_items)} rows -> {len(deduped_scoring_items)} unique items"
+        )
+    scoring_items = deduped_scoring_items
     scoring_workers = min(8, len(scoring_items))
     return list(
         _iter_evaluation_results(
@@ -2115,15 +2122,19 @@ def _run_molmo2_pipeline_stagewise(pending_items, runtime_options, logs_dir, gpu
     )
 
 def _record_item_result(item_result, results, item_count, results_file, progress_callback, res_data=None, res_path=None):
-    results["total"] += 1
-    item_count += 1
+    detail = item_result["detail"]
+    image_name = detail.get("image")
+    details_before = len(results.get("details", []))
+    results.setdefault("details", []).append(detail)
+    deduped_results = _dedupe_results_by_image(results)
+    duplicate_overwrite = bool(image_name) and deduped_results["total"] == details_before
+    results.clear()
+    results.update(deduped_results)
+    item_count = results["total"]
     should_log_checkpoint = item_count == 1 or item_count % 10 == 0
 
-    if item_result["success"]:
-        results["success"] += 1
-    else:
-        results["failure"] += 1
-    results["details"].append(item_result["detail"])
+    if duplicate_overwrite:
+        logger.warning(f"Duplicate result received for {image_name}; keeping the latest record.")
 
     if progress_callback:
         for message in item_result["messages"]:
@@ -2181,6 +2192,15 @@ def _dedupe_results_by_image(results):
         "failure": len(details) - success_count,
         "details": details,
     }
+
+
+def _dedupe_scoring_items(scoring_items):
+    """Keep one scoring task per dataset row so network-failed samples are not evaluated twice."""
+    deduped_by_source_index = {}
+    for scoring_item in scoring_items:
+        source_index = scoring_item[1]
+        deduped_by_source_index[source_index] = scoring_item
+    return list(deduped_by_source_index.values())
 
 def evaluate_model(
     model_name,
@@ -2423,6 +2443,8 @@ def evaluate_model(
                 res_path=res_path,
             )
         
+    results = _dedupe_results_by_image(results)
+
     # Calculate final success rate
     if results["total"] > 0:
         success_rate = results["success"] / results["total"] * 100
