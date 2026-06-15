@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Point-Agent | ERA @ CVPR 2026 PointArena Challenge</title>
+    <meta
+      name="description"
+      content="Technical summary for Team point-agent, 1st place solution in the ERA @ CVPR 2026 PointArena Challenge."
+    />
+    <link rel="stylesheet" href="styles.css?v=53" />
+  </head>
+  <body>
+    <header class="site-nav" aria-label="Page navigation">
+      <div class="site-nav-inner">
+        <a class="brand" href="#top" aria-label="Point-Agent home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>Point-Agent</span>
+        </a>
+        <nav>
+          <a href="#method">Method</a>
+          <a href="#results">Results</a>
+          <a href="#examples">Examples</a>
+          <a href="https://github.com/xiuguangli/PointBenchWorkShop" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-content">
+          <div class="hero-copy">
+            <p class="eyebrow">
+              <a href="https://embodied-reasoning.github.io/" target="_blank" rel="noopener noreferrer">
+                ERA @ CVPR 2026 PointArena Challenge
+              </a>
+            </p>
+            <h1 id="page-title">Point-Agent</h1>
+            <p class="hero-subtitle">
+              A multi-stage visual grounding pipeline that combines Gemini query
+              rewriting, box-level guidance, Molmo2 point prediction, and strict
+              Gemini verification for language-guided pointing.
+            </p>
+            <div class="hero-actions" aria-label="Primary links">
+              <a class="button primary" href="#method">Read the approach</a>
+              <a class="button ghost" href="#results">View results</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="metric-band" aria-label="Challenge snapshot">
+        <article class="metric">
+          <span class="metric-label">Challenge Outcome</span>
+          <strong class="rank-emphasis">1st place</strong>
+          <span>PointArena track</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Evaluation Set</span>
+          <strong>982</strong>
+          <span>text-image pairs</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Average Score</span>
+          <strong>86.05%</strong>
+          <span>Point-Agent (ours)</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">Pipeline Shape</span>
+          <strong>6 stages</strong>
+          <span>rewrite, predict, verify</span>
+        </article>
+      </section>
+
+      <section class="section intro" aria-labelledby="overview-title">
+        <div class="section-heading report-heading">
+          <div>
+            <div class="section-kicker">Overview</div>
+            <h2 id="overview-title">From embodied intent to actionable points</h2>
+          </div>
+          <div class="lead-copy">
+            <p>
+              PointArena frames pointing as an embodied reasoning problem:
+              an agent must translate language into precise visual targets
+              that can support interaction, navigation, manipulation, or
+              downstream action. The benchmark stresses spatial relations,
+              affordance cues, counting, steerable reference-point queries,
+              and general scene reasoning.
+            </p>
+            <p>
+              Point-Agent treats each query as a small perception-action
+              grounding task. It rewrites underspecified instructions into
+              scene-grounded targets, localizes candidate regions, predicts
+              points with Molmo2, and verifies whether the selected pixel
+              actually lies on the object, part, free space, or relation that
+              an embodied agent would need to act on.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="method" class="section method-section" aria-labelledby="method-title">
+        <div class="section-heading">
+          <div>
+            <div class="section-kicker">Method</div>
+            <h2 id="method-title">A verifier-guided embodied pointing pipeline</h2>
+          </div>
+          <p>
+            Point-Agent decomposes each instruction into a query rewrite,
+            visual localization, local point prediction, and conservative
+            verification loop, with cached artifacts at every stage.
+          </p>
+        </div>
+
+        <div class="pipeline-map" aria-label="Point-Agent framework diagram">
+          <div class="pipeline-lane">
+            <article class="flow-node input-node">
+              <div class="stage-head">
+                <span class="step-badge">1</span>
+                <span class="stage-pill">User query</span>
+              </div>
+              <h3>Image + user query</h3>
+              <img class="stage-visual" src="assets/images/steerable_reference_overlay.png" alt="Clock image with a reference point marker for a steerable query." />
+              <p>Load the image, original query, category, and reference-point markers for steerable samples.</p>
+            </article>
+            <article class="flow-node gemini-node">
+              <div class="stage-head">
+                <span class="step-badge">2</span>
+                <span class="stage-pill">Rewrite</span>
+              </div>
+              <h3>Gemini query rewrite</h3>
+              <img class="stage-visual" src="assets/images/method_rewrite_card.svg" alt="Original query rewritten into a concrete target query." />
+              <p>Resolve vague embodied intent into a concrete visual target.</p>
+            </article>
+            <article class="flow-node gemini-node">
+              <div class="stage-head">
+                <span class="step-badge">3</span>
+                <span class="stage-pill">Box helper</span>
+              </div>
+              <h3>Gemini localization hints</h3>
+              <img class="stage-visual" src="assets/images/trace_clock_gemini_boxes.jpg" alt="Gemini helper box around a candidate target region." />
+              <p>Propose candidate boxes, center hints, and distance cues before point prediction.</p>
+            </article>
+            <article class="flow-node molmo-node">
+              <div class="stage-head">
+                <span class="step-badge">4</span>
+                <span class="stage-pill">Point prediction</span>
+              </div>
+              <h3>Molmo2 point predictor</h3>
+              <img class="stage-visual" src="assets/images/trace_clock_molmo_points.jpg?v=49" alt="Molmo2 candidate point prediction on the image." />
+              <p>Predict candidate pixel points from original, rewrite, and hints.</p>
+            </article>
+            <article class="flow-node judge-node">
+              <div class="stage-head">
+                <span class="step-badge">5</span>
+                <span class="stage-pill">Verification</span>
+              </div>
+              <h3>Gemini strict judge</h3>
+              <img class="stage-visual" src="assets/images/trace_clock_judge_view.jpg" alt="Gemini judge view with reference point, prediction, and zoom crop." />
+              <p>Check count, containment, spatial relation, and trigger fallback repair when needed.</p>
+            </article>
+            <article class="flow-node output-node">
+              <div class="stage-head">
+                <span class="step-badge">6</span>
+                <span class="stage-pill">Final points</span>
+              </div>
+              <h3>Final point set</h3>
+              <img class="stage-visual" src="assets/images/trace_clock_overlay_mask_point.jpg" alt="Final mask overlay with accepted prediction point." />
+              <p>Save accepted points, cached stage artifacts, and mask-overlay visualizations for scoring.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="results" class="section results-section" aria-labelledby="results-title">
+        <div class="section-heading">
+          <div>
+            <div class="section-kicker">Results</div>
+            <h2 id="results-title">Evaluation snapshot</h2>
+          </div>
+          <p>
+            The table compares PointAgent (ours) with cited baselines on the
+            PointArena benchmark.
+          </p>
+        </div>
+
+        <div class="score-summary">
+          <div class="score-ring" aria-label="PointAgent average score 86.05 percent">
+            <span>86.05%</span>
+          </div>
+          <div>
+            <h3>PointAgent (ours)</h3>
+            <p>
+              Point-Agent ranked <strong class="rank-emphasis">1st</strong> in the PointArena Challenge, with strong
+              affordance, spatial, and reasoning performance across the
+              benchmark categories.
+            </p>
+          </div>
+        </div>
+
+        <div class="comparison-panel" aria-labelledby="comparison-title">
+          <div class="comparison-heading">
+            <div>
+              <span class="mini-kicker">Report comparison</span>
+              <h3 id="comparison-title">Point-Agent against reported baselines</h3>
+            </div>
+            <p>
+              Baseline values are taken from the cited reports; GPT-5.4 was
+              evaluated by our team. Missing category-level entries are shown
+              with dashes.
+            </p>
+          </div>
+          <div class="comparison-table-wrap">
+            <table class="comparison-table">
+              <thead>
+                <tr>
+                  <th>Method</th>
+                  <th>Average</th>
+                  <th>Affordable</th>
+                  <th>Counting</th>
+                  <th>Reasoning</th>
+                  <th>Spatial</th>
+                  <th>Steerable</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th>GPT-5.4 <span class="source-link">[0]</span></th>
+                  <td>56.42%</td>
+                  <td>71.21%</td>
+                  <td>47.96%</td>
+                  <td>47.67%</td>
+                  <td>61.54%</td>
+                  <td>53.50%</td>
+                </tr>
+                <tr>
+                  <th>MolmoPoint-8B <a class="source-link" href="https://arxiv.org/pdf/2603.28069" target="_blank" rel="noopener noreferrer">[1]</a></th>
+                  <td>70.70%</td>
+                  <td>85.90%</td>
+                  <td>74.50%</td>
+                  <td>77.20%</td>
+                  <td>76.90%</td>
+                  <td>39.00%</td>
+                </tr>
+                <tr>
+                  <th>Seed1.8 <a class="source-link" href="https://lf3-static.bytednsdoc.com/obj/eden-cn/lapzild-tss/ljhwZthlaukjlkulzlp/research/Seed-1.8-Modelcard.pdf" target="_blank" rel="noopener noreferrer">[2]</a></th>
+                  <td>76.50%</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                </tr>
+                <tr>
+                  <th>Seed2.0pro <a class="source-link" href="https://lf3-static.bytednsdoc.com/obj/eden-cn/lapzild-tss/ljhwZthlaukjlkulzlp/seed2/0214/Seed2.0%20Model%20Card.pdf" target="_blank" rel="noopener noreferrer">[3]</a></th>
+                  <td>81.40%</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                </tr>
+                <tr>
+                  <th>Molmo2-4B <a class="source-link" href="https://arxiv.org/pdf/2601.10611" target="_blank" rel="noopener noreferrer">[4]</a></th>
+                  <td>67.70%</td>
+                  <td>82.30%</td>
+                  <td>71.40%</td>
+                  <td>72.00%</td>
+                  <td>71.80%</td>
+                  <td>41.00%</td>
+                </tr>
+                <tr>
+                  <th>Gemini-3-Pro <a class="source-link" href="https://blog.google/innovation-and-ai/technology/developers-tools/gemini-3-pro-vision/" target="_blank" rel="noopener noreferrer">[5]</a></th>
+                  <td>85.50%</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                </tr>
+                <tr class="ours-row">
+                  <th>PointAgent (ours)</th>
+                  <td>86.05%</td>
+                  <td>96.97%</td>
+                  <td>75.00%</td>
+                  <td>88.60%</td>
+                  <td>88.21%</td>
+                  <td>81.50%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="comparison-sources" aria-label="Comparison table sources">
+            <span>Sources:</span>
+            <span class="source-item"><span class="source-num">[0]</span> GPT-5.4: evaluated by our team</span>
+            <a class="source-item" href="https://arxiv.org/pdf/2603.28069" target="_blank" rel="noopener noreferrer"><span class="source-num">[1]</span> MolmoPoint-8B</a>
+            <a class="source-item" href="https://lf3-static.bytednsdoc.com/obj/eden-cn/lapzild-tss/ljhwZthlaukjlkulzlp/research/Seed-1.8-Modelcard.pdf" target="_blank" rel="noopener noreferrer"><span class="source-num">[2]</span> Seed1.8 model card</a>
+            <a class="source-item" href="https://lf3-static.bytednsdoc.com/obj/eden-cn/lapzild-tss/ljhwZthlaukjlkulzlp/seed2/0214/Seed2.0%20Model%20Card.pdf" target="_blank" rel="noopener noreferrer"><span class="source-num">[3]</span> Seed2.0 model card</a>
+            <a class="source-item" href="https://arxiv.org/pdf/2601.10611" target="_blank" rel="noopener noreferrer"><span class="source-num">[4]</span> Molmo2-4B</a>
+            <a class="source-item" href="https://blog.google/innovation-and-ai/technology/developers-tools/gemini-3-pro-vision/" target="_blank" rel="noopener noreferrer"><span class="source-num">[5]</span> Gemini 3 Pro Vision</a>
+          </div>
+        </div>
+      </section>
+
+      <section id="examples" class="section examples-section" aria-labelledby="examples-title">
+        <div class="section-heading">
+          <div>
+            <div class="section-kicker">Qualitative Examples</div>
+            <h2 id="examples-title">Where the pipeline has to reason</h2>
+          </div>
+          <p>
+            Each example compares the original image with a green ground-truth
+            mask overlay and red predicted point markers across all five
+            benchmark categories. For steerable queries, the blue marker shows
+            the reference point used by the instruction.
+          </p>
+        </div>
+
+        <div class="example-grid">
+          <article class="example-card">
+            <img src="assets/images/example_affordance_compare.jpg?v=28" alt="Affordance sample comparing the original sponge image with overlay and predicted point." />
+            <div class="example-copy">
+              <span>Affordance</span>
+              <div class="query-pair">
+                <p><strong>Original query</strong> Point to the object that people use to clean surfaces.</p>
+                <p><strong>Rewritten query</strong> <b>Point to the yellow sponge.</b></p>
+              </div>
+            </div>
+          </article>
+          <article class="example-card">
+            <img src="assets/images/example_spatial_compare.jpg?v=28" alt="Spatial sample comparing the original bus image with overlay and predicted points." />
+            <div class="example-copy">
+              <span>Spatial</span>
+              <div class="query-pair">
+                <p><strong>Original query</strong> Point to the front wheels of the car.</p>
+                <p><strong>Rewritten query</strong> <b>Point to the front wheels of the red bus.</b></p>
+              </div>
+            </div>
+          </article>
+          <article class="example-card">
+            <img src="assets/images/example_reasoning_compare.jpg?v=28" alt="Reasoning sample comparing the original parking-lot image with overlay and predicted point." />
+            <div class="example-copy">
+              <span>Reasoning</span>
+              <div class="query-pair">
+                <p><strong>Original query</strong> Point to the second car from the right.</p>
+                <p><strong>Rewritten query</strong> <b>Point to the black SUV parked next to the rightmost black sedan.</b></p>
+              </div>
+            </div>
+          </article>
+          <article class="example-card">
+            <img src="assets/images/example_counting_compare.jpg?v=28" alt="Counting sample comparing the original bird image with overlay and predicted points." />
+            <div class="example-copy">
+              <span>Counting</span>
+              <div class="query-pair">
+                <p><strong>Original query</strong> Point to all birds.</p>
+                <p><strong>Rewritten query</strong> <b>Point to the two birds perched on the tree branches.</b></p>
+              </div>
+            </div>
+          </article>
+          <article class="example-card">
+            <img src="assets/images/example_steerable_compare.jpg?v=46" alt="Steerable sample comparing the original clock image with blue reference point and overlay with predicted point." />
+            <div class="example-copy">
+              <span>Steerable</span>
+              <div class="query-pair">
+                <p><strong>Original query</strong> Point to the number to the right of the current point on the image.</p>
+                <p><strong>Rewritten query</strong> <b>Point to the number 5 on the clock.</b></p>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="footer">
+      <p>Point-Agent. ERA @ CVPR 2026 PointArena Challenge technical summary.</p>
+      <p><a href="https://github.com/xiuguangli/PointBenchWorkShop" target="_blank" rel="noopener noreferrer">github.com/xiuguangli/PointBenchWorkShop</a></p>
+    </footer>
+  </body>
+</html>

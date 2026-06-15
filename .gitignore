@@ -2,6 +2,10 @@
 *.png
 *.jpeg
 *.webp
+!pointarena_champion_page/assets/images/*.jpg
+!pointarena_champion_page/assets/images/*.png
+!pointarena_champion_page/assets/images/*.jpeg
+!pointarena_champion_page/assets/images/*.webp
 res*.json
 data-src.json
 
