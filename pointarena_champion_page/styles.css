@@ -651,6 +651,11 @@ h3 {
   white-space: nowrap;
 }
 
+.comparison-table th:first-child,
+.comparison-table td:first-child {
+  text-align: left;
+}
+
 .comparison-table thead th {
   border-top: 0;
   background: var(--green-dark);
