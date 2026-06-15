@@ -647,13 +647,8 @@ h3 {
 .comparison-table td {
   padding: 0.75rem 0.95rem;
   border-top: 1px solid var(--line);
-  text-align: right;
+  text-align: center;
   white-space: nowrap;
-}
-
-.comparison-table th:first-child,
-.comparison-table td:first-child {
-  text-align: left;
 }
 
 .comparison-table thead th {
