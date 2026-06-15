@@ -76,10 +76,10 @@ The current project-specific fused pipeline is:
 
 `raw user_input -> transform_gemini_twolines-style Gemini rewrite -> Gemini box/center helper -> refpoint-hybrid Molmo2 -> Gemini judge/fallback`
 
-For closer reproduction of the original evaluate-project setup, the default split is now:
+The current default Gemini configuration for this fused pipeline is:
 
 - `rewrite_model=gemini-3.5-flash`
-- `enhance_model=gemini-3.1-pro-preview`
+- `enhance_model=gemini-3.5-flash`
 
 For Molmo2 weights:
 

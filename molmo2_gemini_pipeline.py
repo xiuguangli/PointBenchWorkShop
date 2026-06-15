@@ -550,7 +550,7 @@ def call_transform_gemini(
 
     api_key = str(options.get("api_key") or os.getenv("API_KEY", "")).strip()
     base_url = str(options.get("base_url") or os.getenv("API_BASE_URL", "")).strip()
-    resolved_model_name = str(model_name or options.get("enhance_model") or os.getenv("API_MODEL_NAME") or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.1-pro-preview")).strip()
+    resolved_model_name = str(model_name or options.get("enhance_model") or os.getenv("API_MODEL_NAME") or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.5-flash")).strip()
     prompt_mode = str(options.get("rewrite_prompt_mode") or REWRITE_PROMPT_MODE).strip() or REWRITE_PROMPT_MODE
     visualizations_dir = str(options.get("visualizations_dir") or "").strip()
 
@@ -2083,7 +2083,7 @@ def build_molmo2_gemini_pipeline_state(
         options.get("enhance_model")
         or options.get("planner_model_name")
         or os.getenv("API_MODEL_NAME")
-        or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.1-pro-preview")
+        or os.getenv("SA2VA_PLANNER_MODEL", "gemini-3.5-flash")
     ).strip()
     rewrite_model_name = str(
         options.get("rewrite_model")
@@ -2627,7 +2627,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python model_evaluator.py \
   --model 1-2 \
   --model_root /path/to/models \
   --query_field enhanced_query \
-  --enhance_model gemini-3.1-pro-preview \
+  --enhance_model gemini-3.5-flash \
   --rewrite_model gemini-3.5-flash \
   --max_tokens 256 \
   --suffix molmo2_guidance_dualquery_refpoint_hybrid_gemini_judge_exp \
@@ -2671,13 +2671,13 @@ Argument descriptions and supported values
     - judge
     - fallback grounding
   - Common values:
-    - `gemini-3.1-pro-preview`
+    - `gemini-3.5-flash`: current default
     - Any other Gemini model name supported by your API endpoint
 
 - `--rewrite_model`
   - Purpose: Gemini model name used only for the transform_gemini_twolines-style rewrite stage.
   - Common values:
-    - `gemini-3.5-flash`: current reproduction-oriented default
+    - `gemini-3.5-flash`: current default
     - Any other Gemini model name supported by your API endpoint
 
 - `--max_tokens`
@@ -2737,7 +2737,7 @@ Notes
 
 - `transform_gemini` is still kept in this file as the internal function `call_transform_gemini(...)`.
 - Internally the rewrite stage follows `transform_gemini_twolines` with the original project's `legacy_reference_overlay` prompt plus the reference-point overlay/grid visualization rules.
-- The default split is now: `rewrite_model=gemini-3.5-flash`, `enhance_model=gemini-3.1-pro-preview`.
+- The current default is: `rewrite_model=gemini-3.5-flash`, `enhance_model=gemini-3.5-flash`.
 - In the refpoint-hybrid version, Gemini helper box grounding is now executed on demand inside PointBench for each sample instead of relying on an externally precomputed `hosted_api_box_center` directory.
 - If the Gemini helper does not produce a box for the current sample, the local prompt automatically falls back to the dualquery prompt branch instead of failing immediately because of the missing box.
 """

@@ -2225,7 +2225,7 @@ def evaluate_model(
     query_field="user_input",
     max_workers=4,
     result_suffix="",
-    enhance_model="gemini-3.1-pro-preview",
+    enhance_model="gemini-3.5-flash",
     rewrite_model="gemini-3.5-flash",
     model_root="",
     max_tokens=256,
@@ -2514,7 +2514,7 @@ def _add_molmo2_gemini_cli_args(parser):
         default="",
         help="Optional local weight root for Molmo2. Leave empty to load/download the HuggingFace repo given by --model; when set to a directory, the code expects <model_root>/<huggingface_repo_id>, for example <model_root>/allenai/Molmo2-4B.",
     )
-    molmo2_group.add_argument("--enhance_model", default="gemini-3.1-pro-preview", help="Gemini model used for helper grounding, judge, and fallback.")
+    molmo2_group.add_argument("--enhance_model", default="gemini-3.5-flash", help="Gemini model used for helper grounding, judge, and fallback.")
     molmo2_group.add_argument("--rewrite_model", default="gemini-3.5-flash", help="Gemini model used for the transform_gemini_twolines-style rewrite stage.")
     molmo2_group.add_argument("--max_tokens", type=int, default=256, help="Max new tokens for Molmo2 generation.")
 
