@@ -388,8 +388,8 @@ h3 {
 .two-column,
 .section-heading {
   display: grid;
-  grid-template-columns: minmax(260px, 0.88fr) minmax(0, 1.12fr);
-  gap: clamp(1.5rem, 4.2vw, 3rem);
+  grid-template-columns: minmax(260px, 0.82fr) minmax(0, 1.18fr);
+  gap: clamp(1.8rem, 4.8vw, 3.4rem);
   align-items: start;
 }
 
@@ -405,6 +405,12 @@ h3 {
   margin: 0;
   color: var(--muted);
   font-size: 0.9rem;
+  text-align: justify;
+  text-justify: inter-word;
+}
+
+.section-heading > :nth-child(2) {
+  margin-left: 1.6rem;
 }
 
 .section-heading > p {
@@ -737,6 +743,8 @@ h3 {
   margin: 0;
   color: var(--muted);
   font-size: 0.84rem;
+  text-align: justify;
+  text-justify: inter-word;
 }
 
 .comparison-table-wrap {
@@ -1004,6 +1012,14 @@ h3 {
   .section-heading,
   .score-summary {
     grid-template-columns: 1fr;
+  }
+
+  .section-heading > p {
+    padding-left: 0;
+  }
+
+  .section-heading > :nth-child(2) {
+    margin-left: 0;
   }
 
   .metric-band {
