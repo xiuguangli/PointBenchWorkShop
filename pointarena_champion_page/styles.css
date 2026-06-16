@@ -284,6 +284,10 @@ h3 {
   padding-top: 1.2rem;
 }
 
+.team-heading {
+  margin-bottom: 1.5rem;
+}
+
 .team-panel {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -292,10 +296,6 @@ h3 {
     rgba(255, 250, 240, 0.94);
   box-shadow: var(--shadow);
   padding: 0.9rem 1rem 1rem;
-}
-
-.team-heading {
-  margin-bottom: 0.7rem;
 }
 
 .team-list {
@@ -343,6 +343,21 @@ h3 {
   font-weight: 800;
 }
 
+.team-member-content strong a {
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(29, 37, 33, 0.38);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.12em;
+}
+
+.team-member-content strong a:hover {
+  color: inherit;
+  text-decoration-color: rgba(29, 37, 33, 0.62);
+}
+
 .team-member-content span {
   color: var(--muted);
   font-size: 0.82rem;
@@ -373,8 +388,8 @@ h3 {
 .two-column,
 .section-heading {
   display: grid;
-  grid-template-columns: minmax(260px, 0.82fr) minmax(0, 1.28fr);
-  gap: clamp(1.6rem, 5vw, 4rem);
+  grid-template-columns: minmax(260px, 0.88fr) minmax(0, 1.12fr);
+  gap: clamp(1.5rem, 4.2vw, 3rem);
   align-items: start;
 }
 
@@ -383,13 +398,17 @@ h3 {
   padding-top: 1.6rem;
 }
 
-.lead-copy p,
-.section-heading p,
+.lead-copy,
+.section-heading > p,
 .example-copy p,
 .score-summary p {
   margin: 0;
   color: var(--muted);
   font-size: 0.9rem;
+}
+
+.section-heading > p {
+  max-width: 36rem;
 }
 
 .example-copy strong {
@@ -405,6 +424,10 @@ h3 {
 .results-section .section-heading,
 .examples-section .section-heading {
   margin-bottom: 1.5rem;
+}
+
+.section-heading h2 {
+  max-width: 14ch;
 }
 
 .pipeline-map {
